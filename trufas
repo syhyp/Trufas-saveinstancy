@@ -597,7 +597,7 @@ local XML_Encoders
 XML_Encoders = {
     _cdata = function(raw) return "<![CDATA["..raw.."]]>" end,
     _protectedString = function(raw)
-        return string_find(raw,"]]>") and string.gsub(raw,ESCAPES_PATTERN,ESCAPES) or XML_Encoders._cdata(raw)
+        raw=string.gsub(raw,"[%z\1-\8\11\12\14-\31]","");return string_find(raw,"]]>") and string.gsub(raw,ESCAPES_PATTERN,ESCAPES) or XML_Encoders._cdata(raw)
     end,
     _normalizeNumber = function(raw)
         if raw~=raw then return "NAN" elseif raw==math.huge then return "INF" elseif raw==-math.huge then return "-INF" end
@@ -721,7 +721,7 @@ XML_Encoders = {
     string = function(raw)
         return (raw==nil or raw=="") and ""
             or string_find(raw,"]]>") and string.gsub(raw,ESCAPES_PATTERN,ESCAPES)
-            or XML_Encoders._cdata(string.gsub(raw,"\0",""))
+            or XML_Encoders._cdata(string.gsub(raw,"[%z\1-\8\11\12\14-\31]",""))
     end,
 }
 
