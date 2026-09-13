@@ -9,7 +9,7 @@ local _WatermarkOk = pcall(function()
     if type(Drawing) ~= "table" and type(Drawing) ~= "userdata" then return end
     local Camera = workspace.CurrentCamera
     local VP = Camera and Camera.ViewportSize or Vector2.new(1280, 720)
-    local word = "Cathedral Crawl"
+    local word = "Trufas"
     local fontSize = 14
     local charW = fontSize * 0.6
     local charH = fontSize * 1.5
