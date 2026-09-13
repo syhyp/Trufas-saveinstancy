@@ -1408,7 +1408,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
         },
         IgnoreSharedStrings=false,SharedStringOverwrite=false,
         TreatUnionsAsParts=not gethiddenproperty or arrayToDict({"Fluxus","Delta","Solara"})[EXECUTOR_NAME] or false,
-        AlternativeWritefile=not arrayToDict({"WRD","Xeno","Zorara"})[EXECUTOR_NAME],
+        AlternativeWritefile=not arrayToDict({"WRD","Zorara"})[EXECUTOR_NAME],
         OptionsAliases={
             timeout="DecompileTimeout",DecompileScripts="Decompile",FileName="FilePath",
             IgnoreArchivable="IgnoreNotArchivable",IgnoreDefaultProps="IgnoreDefaultProperties",
