@@ -2180,16 +2180,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
     local wroteHeader = false
 
     local function save_game()
-        do
-            if IsModel then header..='<Meta name="ExplicitAutoJoints">true</Meta>' end
-            if OPTIONS.AlternativeWritefile and appendfile then
-                writefile(placename, header)
-                wroteHeader = true
-            elseif writefile and not OPTIONS.Callback then
-                writefile(placename, header)
-                wroteHeader = true
-            end
-        end
+   do
+    if IsModel then header..='<Meta name="ExplicitAutoJoints">true</Meta>' end
+end
         SaveNotCreatableWillBeEnabled=SaveNotCreatable
             or (IsolateLocalPlayer or IsolateLocalPlayerCharacter) and IsolateLocalPlayer
             or IsolatePlayers
@@ -2263,34 +2256,32 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
         savebuffer[savebuffer_size]="<!-- Saved by UltraSmartSaveInstance | Patched by Trufas --></roblox>"
         savebuffer_size+=1
         save_cache(true)
-        do
-            local function buildFinal(chunks)
-                if wroteHeader then return table.concat(chunks) end
-                local parts=table.create(#chunks+1); parts[1]=header
-                table.move(chunks,1,#chunks,2,parts)
-                return table.concat(parts)
-            end
-            local Callback=OPTIONS.Callback
-            if Callback then
-                Callback(buildFinal(chunks),chunks)
-            elseif OPTIONS.AlternativeWritefile and appendfile then
-                local SEG=4145728; local tl=0
-                for _,chunk in chunks do tl+=math.ceil(#chunk/SEG) end
-                local cl=0
-                for _,chunk in chunks do
-                    local chl=#chunk; local offset=1
-                    while offset<=chl do
-                        local ss=string.sub(chunk,offset,offset+SEG-1)
-                        run_with_loading("Escrevendo "..math.round(cl/tl*100).."%",nil,true,appendfile,placename,ss)
-                        cl+=1; offset+=SEG
-                        if offset<=chl then task.wait() end
-                    end
+     do
+        local function buildFinal(chunks)
+            local parts=table.create(#chunks+1); parts[1]=header
+            table.move(chunks,1,#chunks,2,parts)
+            return table.concat(parts)
+        end
+        local Callback=OPTIONS.Callback
+        if Callback then
+            Callback(buildFinal(chunks),chunks)
+        elseif OPTIONS.AlternativeWritefile and appendfile then
+            local full=buildFinal(chunks)
+            local SEG=4145728; local tl=math.ceil(#full/SEG); local cl=0; local offset=1
+            while offset<=#full do
+                local ss=string.sub(full,offset,offset+SEG-1)
+                if cl==0 then
+                    run_with_loading("Escrevendo "..math.round(cl/tl*100).."%",nil,true,writefile,placename,ss)
+                else
+                    run_with_loading("Escrevendo "..math.round(cl/tl*100).."%",nil,true,appendfile,placename,ss)
                 end
-            else
-                run_with_loading("Escrevendo "..get_size_format().." no arquivo",nil,true,writefile,placename,buildFinal(chunks))
+                cl+=1; offset+=SEG
             end
+        else
+            run_with_loading("Escrevendo "..get_size_format().." no arquivo",nil,true,writefile,placename,buildFinal(chunks))
         end
     end
+end
 
     local Connections={}
     local function Connect(event,func) table.insert(Connections,event:Connect(func)) end
