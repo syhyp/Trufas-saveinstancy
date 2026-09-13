@@ -1909,7 +1909,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
         return Item
     end
 
-    local function save_hierarchy(root_hierarchy)
+        local function save_hierarchy(root_hierarchy)
         local stack = {}
         local stack_size = 0
 
@@ -1933,215 +1933,220 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
             local item = pop()
 
             if type(item) == "string" then
-                savebuffer[savebuffer_size] = item
-                savebuffer_size += 1
+                local resetPrefix = "__DECOMPILE_RESET__"
+                if string.sub(item, 1, #resetPrefix) == resetPrefix then
+                    DecompileIgnoring = nil
+                else
+                    savebuffer[savebuffer_size] = item
+                    savebuffer_size += 1
+                end
                 continue
             end
 
             local instance = item
-            local IO,CTO,CNO
+            local IO, CTO, CNO
             if not IO then
-                IO=InstancesOverrides[instance]
-                if IO then CTO=IO.__ClassName end
+                IO = InstancesOverrides[instance]
+                if IO then CTO = IO.__ClassName end
             end
-            local ClassName=instance.ClassName
-            local InstanceName=instance.Name
+            local ClassName = instance.ClassName
+            local InstanceName = instance.Name
             local SkipEntirely
 
             if not CTO then
                 if IgnoreNotArchivable and not instance.Archivable then continue end
-                SkipEntirely=IgnoreList[instance]
+                SkipEntirely = IgnoreList[instance]
                 if SkipEntirely then continue end
                 do
-                    local OIL=IgnoreList[ClassName]
-                    if OIL and (OIL==true or OIL[InstanceName]) then continue end
+                    local OIL = IgnoreList[ClassName]
+                    if OIL and (OIL == true or OIL[InstanceName]) then continue end
                 end
                 if not DecompileIgnoring then
-                    DecompileIgnoring=DecompileIgnore[instance]
-                    if DecompileIgnoring==nil then
-                        local DI=DecompileIgnore[ClassName]
-                        if DI then DecompileIgnoring=DI==true or DI[InstanceName] end
+                    DecompileIgnoring = DecompileIgnore[instance]
+                    if DecompileIgnoring == nil then
+                        local DI = DecompileIgnore[ClassName]
+                        if DI then DecompileIgnoring = DI == true or DI[InstanceName] end
                     end
-                    if DecompileIgnoring then DecompileIgnoring=instance
-                    elseif DecompileIgnoring==false then DecompileIgnoring=1 end
+                    if DecompileIgnoring then DecompileIgnoring = instance
+                    elseif DecompileIgnoring == false then DecompileIgnoring = 1 end
                 end
                 do
-                    local Fix=NotCreatableFixes[ClassName]
+                    local Fix = NotCreatableFixes[ClassName]
                     if Fix then
-                        if SaveNotCreatable then ClassName,IO=Fix,replaceClassName(instance,InstanceName,ClassName)
+                        if SaveNotCreatable then ClassName, IO = Fix, replaceClassName(instance, InstanceName, ClassName)
                         else continue end
                     else
                         if TreatUnionsAsParts and instance:IsA("PartOperation") then
-                            ClassName,IO="Part",replaceClassName(instance,InstanceName,ClassName)
-                            CNO="BasePart"
+                            ClassName, IO = "Part", replaceClassName(instance, InstanceName, ClassName)
+                            CNO = "BasePart"
                         elseif not ClassList[ClassName] then
-                            if __DEBUG_MODE then __DEBUG_MODE("Class not Found",ClassName) end
-                            CTO=ClassName; ClassName="Folder"
+                            if __DEBUG_MODE then __DEBUG_MODE("Class not Found", ClassName) end
+                            CTO = ClassName; ClassName = "Folder"
                         end
                     end
                 end
             end
 
             if IO and IO.__SaveSpecific then
-                savebuffer[savebuffer_size]=save_specific(ClassName,IO.Properties)
-                savebuffer_size+=1
+                savebuffer[savebuffer_size] = save_specific(ClassName, IO.Properties)
+                savebuffer_size += 1
             else
-                savebuffer[savebuffer_size]=ReturnItem(CTO or ClassName,instance)
-                savebuffer_size+=1; saved_count+=1
+                savebuffer[savebuffer_size] = ReturnItem(CTO or ClassName, instance)
+                savebuffer_size += 1; saved_count += 1
                 if not (IgnorePropertiesOfNotScriptsOnScriptsMode and not isLuaSourceContainer(instance)) then
-                    local di,ndi
+                    local di, ndi
                     if IgnoreDefaultProperties then
-                        di=defaultInstances[ClassName]
+                        di = defaultInstances[ClassName]
                         if not di then
-                            local Class=ClassList[ClassName]
+                            local Class = ClassList[ClassName]
                             if not Class.NotCreatable then
-                                local ok,result=pcall(Instance.new,ClassName)
+                                local ok, result = pcall(Instance.new, ClassName)
                                 if ok then
-                                    ndi=result
-                                    di={}
-                                    defaultInstances[ClassName]=di
+                                    ndi = result
+                                    di = {}
+                                    defaultInstances[ClassName] = di
                                     task.defer(function() ndi:Destroy() end)
-                                else Class.NotCreatable=true end
+                                else Class.NotCreatable = true end
                             end
                         end
                     end
-                    for _,Property in GetInheritedProps(CNO or ClassName) do
-                        local PropertyName=Property.Name
+                    for _, Property in GetInheritedProps(CNO or ClassName) do
+                        local PropertyName = Property.Name
                         if IgnoreProperties[PropertyName] then continue end
-                        local ValueType=Property.ValueType
-                        if IgnoreSharedStrings and ValueType=="SharedString" and not KeepSharedStrings[PropertyName] then continue end
-                        local Special,Category,Optional=Property.Special,Property.Category,Property.Optional
+                        local ValueType = Property.ValueType
+                        if IgnoreSharedStrings and ValueType == "SharedString" and not KeepSharedStrings[PropertyName] then continue end
+                        local Special, Category, Optional = Property.Special, Property.Category, Property.Optional
                         local raw
-                        if not (ValueType=="ProtectedString" and PropertyName=="Source" and isLuaSourceContainer(instance)) then
-                            raw=ReadProperty(instance,Property,PropertyName,Special,Category,Optional)
-                            if raw==__BREAK then
-                                local GHPF,Fallback=Property.GHPFFailed,Property.Fallback
+                        if not (ValueType == "ProtectedString" and PropertyName == "Source" and isLuaSourceContainer(instance)) then
+                            raw = ReadProperty(instance, Property, PropertyName, Special, Category, Optional)
+                            if raw == __BREAK then
+                                local GHPF, Fallback = Property.GHPFFailed, Property.Fallback
                                 if GHPF and not Fallback then continue end
                                 if not GHPF then
-                                    local ok,result=pcall(gethiddenproperty_fallback,instance,PropertyName)
-                                    if result==nil and not Optional then ok=nil end
-                                    if ok then raw=result
-                                    else GHPF=true; Property.GHPFFailed=GHPF end
+                                    local ok, result = pcall(gethiddenproperty_fallback, instance, PropertyName)
+                                    if result == nil and not Optional then ok = nil end
+                                    if ok then raw = result
+                                    else GHPF = true; Property.GHPFFailed = GHPF end
                                 end
                                 if GHPF and Fallback then
-                                    local ok,result=pcall(Fallback,instance)
-                                    if ok then raw=result
-                                    else Property.Fallback=nil; continue end
+                                    local ok, result = pcall(Fallback, instance)
+                                    if ok then raw = result
+                                    else Property.Fallback = nil; continue end
                                 end
-                                if raw==__BREAK then continue end
+                                if raw == __BREAK then continue end
                             end
                             if di and Property.CanRead and not Property.Special then
-                                if ndi then di[PropertyName]=index(ndi,PropertyName) end
-                                if di[PropertyName]==raw then continue end
+                                if ndi then di[PropertyName] = index(ndi, PropertyName) end
+                                if di[PropertyName] == raw then continue end
                             end
                         end
-                        if SharedStringOverwrite and ValueType=="BinaryString" then ValueType="SharedString" end
+                        if SharedStringOverwrite and ValueType == "BinaryString" then ValueType = "SharedString" end
                         if AnonymizableTypes and AnonymizableTypes[ValueType] then
-                            if ValueType=="string" then raw=gsubCI(raw,LP_Name,ANON_Name)
-                            elseif raw==LP_UserId then raw=ANON_UserId end
+                            if ValueType == "string" then raw = gsubCI(raw, LP_Name, ANON_Name)
+                            elseif raw == LP_UserId then raw = ANON_UserId end
                         end
-                        local tag,value
-                        if Category=="Class" then
-                            tag="Ref"
+                        local tag, value
+                        if Category == "Class" then
+                            tag = "Ref"
                             if raw then
                                 if SaveNotCreatableWillBeEnabled then
-                                    local Fix=NotCreatableFixes[raw.ClassName]
-                                    if Fix and (PropertyName=="PlayerToHideFrom" or ValueType~="Instance" and ValueType~=Fix) then continue end
+                                    local Fix = NotCreatableFixes[raw.ClassName]
+                                    if Fix and (PropertyName == "PlayerToHideFrom" or ValueType ~= "Instance" and ValueType ~= Fix) then continue end
                                 end
-                                value=getRef(raw)
-                            else value="null" end
-                        elseif Category=="Enum" then
-                            value,tag=XML_Encoders.EnumItem(raw)
+                                value = getRef(raw)
+                            else value = "null" end
+                        elseif Category == "Enum" then
+                            value, tag = XML_Encoders.EnumItem(raw)
                         else
-                            local encoder=XML_Encoders[ValueType]
+                            local encoder = XML_Encoders[ValueType]
                             if encoder then
-                                value,tag=ReturnValueAndTag(raw,ValueType,encoder)
-                            elseif ValueType=="ProtectedString" then
-                                tag=ValueType
-                                if PropertyName=="Source" then
+                                value, tag = ReturnValueAndTag(raw, ValueType, encoder)
+                            elseif ValueType == "ProtectedString" then
+                                tag = ValueType
+                                if PropertyName == "Source" then
                                     if DecompileIgnoring then
-                                        if DecompileIgnoring==1 then DecompileIgnoring=nil end
-                                        value="-- Ignored"
+                                        if DecompileIgnoring == 1 then DecompileIgnoring = nil end
+                                        value = "-- Ignored"
                                     else
-                                        local should_decompile=true
+                                        local should_decompile = true
                                         local LinkedSource
-                                        local o,LSU=pcall(index,instance,"LinkedSource")
-                                        if not o then LSU="" end
-                                        local hLS=LSU~=""
+                                        local o, LSU = pcall(index, instance, "LinkedSource")
+                                        if not o then LSU = "" end
+                                        local hLS = LSU ~= ""
                                         local LST
                                         if hLS then
-                                            local Path=instance:GetFullName()
-                                            if RecoveredScripts then table.insert(RecoveredScripts,Path) end
-                                            LinkedSource=string.match(LSU,"%w+$")
+                                            local Path = instance:GetFullName()
+                                            if RecoveredScripts then table.insert(RecoveredScripts, Path) end
+                                            LinkedSource = string.match(LSU, "%w+$")
                                             if LinkedSource then
                                                 if ScriptCache then
-                                                    local cached=ldeccache[LinkedSource]
-                                                    if cached then value=cached; should_decompile=nil end
+                                                    local cached = ldeccache[LinkedSource]
+                                                    if cached then value = cached; should_decompile = nil end
                                                 end
                                                 if should_decompile then
-                                                    if DecompileJobless then value="-- Not found in LinkedSource ScriptCache"; should_decompile=nil end
-                                                    LST=string.find(LinkedSource,"%a") and "hash" or "id"
-                                                    local asset=LST.."="..LinkedSource
-                                                    local ok,source=pcall(function()
-                                                        return game:HttpGet("https://assetdelivery.roproxy.com/v1/asset/?"..asset)
+                                                    if DecompileJobless then value = "-- Not found in LinkedSource ScriptCache"; should_decompile = nil end
+                                                    LST = string.find(LinkedSource, "%a") and "hash" or "id"
+                                                    local asset = LST .. "=" .. LinkedSource
+                                                    local ok, source = pcall(function()
+                                                        return game:HttpGet("https://assetdelivery.roproxy.com/v1/asset/?" .. asset)
                                                     end)
                                                     if ok and filterLinkedSource(source) then
-                                                        if ScriptCache then ldeccache[LinkedSource]=source end
-                                                        value=source; should_decompile=nil
+                                                        if ScriptCache then ldeccache[LinkedSource] = source end
+                                                        value = source; should_decompile = nil
                                                     end
                                                 end
                                             else
-                                                warn("FAILED TO EXTRACT ORIGINAL SCRIPT SOURCE:",instance:GetFullName(),LSU)
+                                                warn("FAILED TO EXTRACT ORIGINAL SCRIPT SOURCE:", instance:GetFullName(), LSU)
                                             end
                                         end
                                         if should_decompile then
-                                            local iLS=instance:IsA("LocalScript")
-                                            if iLS and instance.RunContext==Enum.RunContext.Server
-                                                or not iLS and instance:IsA("Script") and instance.RunContext~=Enum.RunContext.Client then
-                                                value="-- [FilteringEnabled] Server Scripts are IMPOSSIBLE to save"
+                                            local iLS = instance:IsA("LocalScript")
+                                            if iLS and instance.RunContext == Enum.RunContext.Server
+                                                or not iLS and instance:IsA("Script") and instance.RunContext ~= Enum.RunContext.Client then
+                                                value = "-- [FilteringEnabled] Server Scripts are IMPOSSIBLE to save"
                                             else
-                                                value=ldecompile(instance)
+                                                value = ldecompile(instance)
                                                 if SaveBytecode then
-                                                    local out=SaveBytecode(instance)
-                                                    if out then value=out..value end
+                                                    local out = SaveBytecode(instance)
+                                                    if out then value = out .. value end
                                                 end
                                             end
                                         end
-                                        value="-- Saved by UltraSmartSaveInstance | Patched by Trufas\n\n"
-                                            ..(hLS and "-- Original Source: https://assetdelivery.roblox.com/v1/asset/?"..(LST or "id").."="..(LinkedSource or LSU).."\n\n" or "")
-                                            ..value
+                                        value = "-- Saved by UltraSmartSaveInstance | Patched by Trufas\n\n"
+                                            .. (hLS and "-- Original Source: https://assetdelivery.roblox.com/v1/asset/?" .. (LST or "id") .. "=" .. (LinkedSource or LSU) .. "\n\n" or "")
+                                            .. value
                                     end
                                 end
-                                value=XML_Encoders._protectedString(value)
+                                value = XML_Encoders._protectedString(value)
                             else
                                 if Optional then
-                                    encoder=XML_Encoders[Optional]
+                                    encoder = XML_Encoders[Optional]
                                     if encoder then
-                                        if raw==nil then continue
-                                        else value,tag=ReturnValueAndTag(raw,ValueType,encoder) end
+                                        if raw == nil then continue
+                                        else value, tag = ReturnValueAndTag(raw, ValueType, encoder) end
                                     end
                                 end
                             end
                         end
                         if tag then
-                            savebuffer[savebuffer_size]=ReturnProperty(tag,PropertyName,value)
-                            savebuffer_size+=1
+                            savebuffer[savebuffer_size] = ReturnProperty(tag, PropertyName, value)
+                            savebuffer_size += 1
                         else
-                            warn("UNSUPPORTED TYPE:",ValueType,ClassName,PropertyName)
+                            warn("UNSUPPORTED TYPE:", ValueType, ClassName, PropertyName)
                         end
                     end
                 end
-                savebuffer[savebuffer_size]="</Properties>"
-                savebuffer_size+=1
-                if SaveCacheInterval<savebuffer_size then save_cache() end
+                savebuffer[savebuffer_size] = "</Properties>"
+                savebuffer_size += 1
+                if SaveCacheInterval < savebuffer_size then save_cache() end
             end
 
-            if SkipEntirely~=false then
-                local Children=IO and IO.__Children or instance:GetChildren()
-                if #Children~=0 then
+            if SkipEntirely ~= false then
+                local Children = IO and IO.__Children or instance:GetChildren()
+                if #Children ~= 0 then
                     push("</Item>")
-                    if DecompileIgnoring and DecompileIgnoring==instance then
-                        push("__DECOMPILE_RESET__"..tostring(instance))
+                    if DecompileIgnoring and DecompileIgnoring == instance then
+                        push("__DECOMPILE_RESET__" .. tostring(instance))
                     end
                     for i = #Children, 1, -1 do
                         push(Children[i])
@@ -2150,9 +2155,9 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
                 end
             end
 
-            if DecompileIgnoring and DecompileIgnoring==instance then DecompileIgnoring=nil end
-            savebuffer[savebuffer_size]="</Item>"
-            savebuffer_size+=1
+            if DecompileIgnoring and DecompileIgnoring == instance then DecompileIgnoring = nil end
+            savebuffer[savebuffer_size] = "</Item>"
+            savebuffer_size += 1
         end
     end
 
@@ -2177,50 +2182,68 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
         end
     end
 
-    local wroteHeader = false
+        local Connections = {}
+    local function Connect(event, func)
+        table.insert(Connections, event:Connect(func))
+    end
+    local function Cleanup()
+        for _, c in Connections do c:Disconnect() end
+        if LoadingThread then task.cancel(LoadingThread); LoadingThread = nil end
+        GLOBAL_ENV[placename] = nil
+        _removeWatermark()
+    end
 
     local function save_game()
-   do
-    if IsModel then header..='<Meta name="ExplicitAutoJoints">true</Meta>' end
-end
-        SaveNotCreatableWillBeEnabled=SaveNotCreatable
+        local headerFinal = header
+        if IsModel then headerFinal = headerFinal .. '<Meta name="ExplicitAutoJoints">true</Meta>' end
+
+        local function buildFinal(chunks)
+            local parts = table.create(#chunks + 1)
+            parts[1] = headerFinal
+            table.move(chunks, 1, #chunks, 2, parts)
+            return table.concat(parts)
+        end
+
+        SaveNotCreatableWillBeEnabled = SaveNotCreatable
             or (IsolateLocalPlayer or IsolateLocalPlayerCharacter) and IsolateLocalPlayer
             or IsolatePlayers
             or NilInstances and global_container.getnilinstances
+
         save_hierarchy(ToSaveList)
+
         if IsolateLocalPlayer or IsolateLocalPlayerCharacter then
-            local LP=service.Players.LocalPlayer
+            local LP = service.Players.LocalPlayer
             if LP then
-                if IsolateLocalPlayer then SaveNotCreatable=true; save_extra("LocalPlayer",LP,true) end
+                if IsolateLocalPlayer then SaveNotCreatable = true; save_extra("LocalPlayer", LP, true) end
                 if IsolateLocalPlayerCharacter then
-                    local LPC=LP.Character
-                    if LPC then save_extra("LocalPlayer Character",LPC,true,"Model") end
+                    local LPC = LP.Character
+                    if LPC then save_extra("LocalPlayer Character", LPC, true, "Model") end
                 end
             end
         end
-        if IsolateStarterPlayer then save_extra("StarterPlayer",service.StarterPlayer) end
-        if IsolatePlayers then SaveNotCreatable=true; save_extra("Players",service.Players) end
+        if IsolateStarterPlayer then save_extra("StarterPlayer", service.StarterPlayer) end
+        if IsolatePlayers then SaveNotCreatable = true; save_extra("Players", service.Players) end
         if NilInstances and global_container.getnilinstances then
-            local ni,nis={},1
-            local NIF=OPTIONS.NilInstancesFixes
-            for _,instance in global_container.getnilinstances() do
-                if instance==game then instance=nil
+            local ni, nis = {}, 1
+            local NIF = OPTIONS.NilInstancesFixes
+            for _, instance in global_container.getnilinstances() do
+                if instance == game then instance = nil
                 else
-                    local CN=instance.ClassName
-                    local Fix=InheritsFix(NIF,CN,instance)
-                    if Fix then instance=Fix(instance,InstancesOverrides) end
-                    local Class=ClassList[CN]
-                    if Class then if Class.Service then instance=nil end end
+                    local CN = instance.ClassName
+                    local Fix = InheritsFix(NIF, CN, instance)
+                    if Fix then instance = Fix(instance, InstancesOverrides) end
+                    local Class = ClassList[CN]
+                    if Class then if Class.Service then instance = nil end end
                 end
-                if instance then ni[nis]=instance; nis+=1 end
+                if instance then ni[nis] = instance; nis += 1 end
             end
-            SaveNotCreatable=true; save_extra("Nil Instances",ni)
+            SaveNotCreatable = true; save_extra("Nil Instances", ni)
         end
         if OPTIONS.ReadMe then
-            save_extra("README",nil,nil,"Script",
+            save_extra("README", nil, nil, "Script",
                 "--[[\n"
-                ..(#RecoveredScripts~=0 and "\t\tIMPORTANT: Original Source of these Scripts was Recovered: "..service.HttpService:JSONEncode(RecoveredScripts).."\n" or "")
-                ..[[
+                .. (#RecoveredScripts ~= 0 and "\t\tIMPORTANT: Original Source of these Scripts was Recovered: " .. service.HttpService:JSONEncode(RecoveredScripts) .. "\n" or "")
+                .. [[
 
     Saved by UltraSmartSaveInstance | Patched by Trufas
 
@@ -2237,59 +2260,44 @@ end
     Fix Camera (Studio Command Bar):
     workspace.CurrentCamera.CameraType = Enum.CameraType.Fixed
     ]]
-                .."\n\tSettings: "..service.HttpService:JSONEncode(OPTIONS)
-                .."\n\tElapsed: "..os.clock()-elapse_t
-                .."\n\tExecutor: "..(identify_executor and table.concat({identify_executor()}," ") or "Unknown")
-                .."\n]]"
+                .. "\n\tSettings: " .. service.HttpService:JSONEncode(OPTIONS)
+                .. "\n\tElapsed: " .. os.clock() - elapse_t
+                .. "\n\tExecutor: " .. (identify_executor and table.concat({identify_executor()}, " ") or "Unknown")
+                .. "\n]]"
             )
         end
         do
-            local tmp={"<SharedStrings>"}
-            for value,id in sharedStrings do
-                table.insert(tmp,'<SharedString md5="'..id..'">'..value.."</SharedString>")
+            local tmp = {"<SharedStrings>"}
+            for value, id in sharedStrings do
+                table.insert(tmp, '<SharedString md5="' .. id .. '">' .. value .. "</SharedString>")
             end
-            if 1<#tmp then
-                savebuffer[savebuffer_size]=table.concat(tmp); savebuffer_size+=1
-                savebuffer[savebuffer_size]="</SharedStrings>"; savebuffer_size+=1
+            if 1 < #tmp then
+                savebuffer[savebuffer_size] = table.concat(tmp); savebuffer_size += 1
+                savebuffer[savebuffer_size] = "</SharedStrings>"; savebuffer_size += 1
             end
         end
-        savebuffer[savebuffer_size]="<!-- Saved by UltraSmartSaveInstance | Patched by Trufas --></roblox>"
-        savebuffer_size+=1
+        savebuffer[savebuffer_size] = "<!-- Saved by UltraSmartSaveInstance | Patched by Trufas --></roblox>"
+        savebuffer_size += 1
         save_cache(true)
-     do
-        local function buildFinal(chunks)
-            local parts=table.create(#chunks+1); parts[1]=header
-            table.move(chunks,1,#chunks,2,parts)
-            return table.concat(parts)
-        end
-        local Callback=OPTIONS.Callback
+
+        local Callback = OPTIONS.Callback
         if Callback then
-            Callback(buildFinal(chunks),chunks)
+            Callback(buildFinal(chunks), chunks)
         elseif OPTIONS.AlternativeWritefile and appendfile then
-            local full=buildFinal(chunks)
-            local SEG=4145728; local tl=math.ceil(#full/SEG); local cl=0; local offset=1
-            while offset<=#full do
-                local ss=string.sub(full,offset,offset+SEG-1)
-                if cl==0 then
-                    run_with_loading("Escrevendo "..math.round(cl/tl*100).."%",nil,true,writefile,placename,ss)
+            local full = buildFinal(chunks)
+            local SEG = 4145728; local tl = math.ceil(#full / SEG); local cl = 0; local offset = 1
+            while offset <= #full do
+                local ss = string.sub(full, offset, offset + SEG - 1)
+                if cl == 0 then
+                    run_with_loading("Escrevendo " .. math.round(cl / tl * 100) .. "%", nil, true, writefile, placename, ss)
                 else
-                    run_with_loading("Escrevendo "..math.round(cl/tl*100).."%",nil,true,appendfile,placename,ss)
+                    run_with_loading("Escrevendo " .. math.round(cl / tl * 100) .. "%", nil, true, appendfile, placename, ss)
                 end
-                cl+=1; offset+=SEG
+                cl += 1; offset += SEG
             end
         else
-            run_with_loading("Escrevendo "..get_size_format().." no arquivo",nil,true,writefile,placename,buildFinal(chunks))
+            run_with_loading("Escrevendo " .. get_size_format() .. " no arquivo", nil, true, writefile, placename, buildFinal(chunks))
         end
-    end
-end
-
-    local Connections={}
-    local function Connect(event,func) table.insert(Connections,event:Connect(func)) end
-    local function Cleanup()
-        for _,c in Connections do c:Disconnect() end
-        if LoadingThread then task.cancel(LoadingThread); LoadingThread=nil end
-        GLOBAL_ENV[placename]=nil
-        _removeWatermark()
     end
 
     do
