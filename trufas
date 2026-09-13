@@ -1375,7 +1375,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
     local realcheck=false
     local cached_physicsgrid,cached_smoothgrid
     local savebuffer,savebuffer_size={},1
-    local header='<!-- Saved by UltraSmartSaveInstance | Patched by Trufas --><roblox version="4">'
+    local header='<roblox version="4"><!-- Saved by UltraSmartSaveInstance | Patched by Trufas -->'
     local StatusText
     local elapse_start = os.clock()
     local estimated_total = 0
@@ -2260,7 +2260,7 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
                 savebuffer[savebuffer_size]="</SharedStrings>"; savebuffer_size+=1
             end
         end
-        savebuffer[savebuffer_size]="</roblox><!-- Saved by UltraSmartSaveInstance | Patched by Trufas -->"
+        savebuffer[savebuffer_size]="<!-- Saved by UltraSmartSaveInstance | Patched by Trufas --></roblox>"
         savebuffer_size+=1
         save_cache(true)
         do
