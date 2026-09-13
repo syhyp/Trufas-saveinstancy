@@ -146,11 +146,9 @@ local service = setmetatable({}, {
     end,
 })
 
-local sharedStringId = 0
 local sharedStrings = setmetatable({}, {
     __index = function(self, str)
-        local id = string.format("USSI%016X", sharedStringId)
-        sharedStringId += 1
+        local id = string.lower(game:GetService("HttpService"):GenerateGUID(false):gsub("-",""))
         self[str] = id
         return id
     end,
