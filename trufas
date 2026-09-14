@@ -174,13 +174,16 @@ local function computeMD5(data)
         A = u32add(A, a); B = u32add(B, b); C = u32add(C, c); D = u32add(D, d)
     end
 
-    local function fmt(v)
-        return string.format("%02x%02x%02x%02x",
-            band(v, 0xFF), band(rshift(v, 8), 0xFF),
-            band(rshift(v, 16), 0xFF), band(rshift(v, 24), 0xFF))
+    local function bytes(v)
+        return string.char(
+            band(v, 0xFF),
+            band(rshift(v, 8), 0xFF),
+            band(rshift(v, 16), 0xFF),
+            band(rshift(v, 24), 0xFF)
+        )
     end
 
-    return fmt(A) .. fmt(B) .. fmt(C) .. fmt(D)
+    return bytes(A) .. bytes(B) .. bytes(C) .. bytes(D)
 end
 
 local sharedStrings = {}
@@ -711,7 +714,7 @@ XML_Encoders = {
     if encoded == "" then return nil end
     local id = rawget(sharedStrings, encoded)
     if not id then
-        id = computeMD5(raw)
+        id = base64encode(computeMD5(raw))
         rawset(sharedStrings, encoded, id)
     end
     return id
