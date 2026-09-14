@@ -687,9 +687,9 @@ XML_Encoders = {
     end,
     Region3int16 = function(raw) return XML_Encoders._minMax(raw.Min,raw.Max,XML_Encoders.Vector3int16) end,
     SharedString = function(raw)
-    if #raw < 20 then return "" end
+    if #raw < 20 then return nil end
     local encoded = XML_Encoders.BinaryString(raw)
-    if encoded == "" then return "" end
+    if encoded == "" then return nil end
     local id = rawget(sharedStrings, encoded)
     if not id then
         id = computeMD5(raw)
@@ -1927,10 +1927,11 @@ local function synsaveinstance(CustomOptions, CustomOptions2)
         return "<"..tag..' name="'..pn..'">'..value.."</"..tag..">"
     end
 
-    local function ReturnValueAndTag(raw,valueType,encoder)
-        local value,tag=(encoder or XML_Encoders[valueType])(raw)
-        return value, tag or valueType
-    end
+   local function ReturnValueAndTag(raw,valueType,encoder)
+    local value,tag=(encoder or XML_Encoders[valueType])(raw)
+    if value == nil then return nil, nil end
+    return value, tag or valueType
+end
 
     local function InheritsFix(fixes,className,instance)
         local Fix=fixes[className]
