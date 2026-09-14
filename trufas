@@ -687,7 +687,7 @@ XML_Encoders = {
     end,
     Region3int16 = function(raw) return XML_Encoders._minMax(raw.Min,raw.Max,XML_Encoders.Vector3int16) end,
     SharedString = function(raw)
-    if #raw < 20 then return nil end
+    if #raw < 32 then return nil end
     local encoded = XML_Encoders.BinaryString(raw)
     if encoded == "" then return nil end
     local id = rawget(sharedStrings, encoded)
