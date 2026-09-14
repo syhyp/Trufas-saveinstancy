@@ -706,16 +706,12 @@ XML_Encoders = {
     end,
     Region3int16 = function(raw) return XML_Encoders._minMax(raw.Min,raw.Max,XML_Encoders.Vector3int16) end,
    SharedString = function(raw)
-    if #raw < 32 then return nil end
+    if #raw < 16 then return nil end
     local encoded = XML_Encoders.BinaryString(raw)
     if encoded == "" then return nil end
     local id = rawget(sharedStrings, encoded)
     if not id then
         id = computeMD5(raw)
-        if #id ~= 32 then
-            id = string.format("%032x", #raw) .. string.sub(tostring(os.clock()):gsub("%.", ""), 1, 0)
-            id = computeMD5(id .. encoded)
-        end
         rawset(sharedStrings, encoded, id)
     end
     return id
@@ -2501,6 +2497,30 @@ end
             end
         end
     end
+
+do
+    local MIN_SIZES = {
+        MeshData2 = 1,
+        ChildData2 = 1,
+        PhysicalConfigData = 1,
+        CollisionData = 16,
+        PhysicsData = 1,
+        TriangleMeshData = 1,
+    }
+    local tmp = {"<SharedStrings>"}
+    for value, id in sharedStrings do
+        local decoded_len = math.floor(#value * 3 / 4)
+        if string.sub(value, -2) == "==" then decoded_len -= 2
+        elseif string.sub(value, -1) == "=" then decoded_len -= 1 end
+        if decoded_len > 0 then
+            table.insert(tmp, '<SharedString md5="' .. id .. '">' .. value .. "</SharedString>")
+        end
+    end
+    if 1 < #tmp then
+        savebuffer[savebuffer_size] = table.concat(tmp); savebuffer_size += 1
+        savebuffer[savebuffer_size] = "</SharedStrings>"; savebuffer_size += 1
+    end
+end
 
     do
         if OPTIONS.SafeMode then
