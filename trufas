@@ -111,19 +111,27 @@ local function computeMD5(data)
         return u32add(u32add(a, b), u32add(c, d))
     end
 
-    local function rol(v, n) return bor(lshift(v, n), rshift(v, 32 - n)) end
+    local function rol(v, n)
+        return bor(lshift(v, n), rshift(v, 32 - n))
+    end
 
     local A, B, C, D = 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476
 
     local len = #data
     local pad_len = 64 - ((len + 9) % 64)
-    if pad_len == 64 then pad_len = 0 end
+    if pad_len == 64 then
+        pad_len = 0
+    end
+
     local total_len = len + 1 + pad_len + 8
     local msg = buffer.create(total_len)
+
     buffer.writestring(msg, 0, data)
     buffer.writeu8(msg, len, 0x80)
+
     local bit_len_lo = band(len * 8, 0xFFFFFFFF)
     local bit_len_hi = band(math.floor(len / 0x20000000), 0xFFFFFFFF)
+
     buffer.writeu32(msg, total_len - 8, bit_len_lo)
     buffer.writeu32(msg, total_len - 4, bit_len_hi)
 
@@ -140,15 +148,17 @@ local function computeMD5(data)
 
     local S = {
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-        5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20, 5,  9, 14, 20,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
         4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
         6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
     }
 
     local msglen = buffer.len(msg)
+
     for blk = 0, msglen / 64 - 1 do
         local off = blk * 64
         local M = {}
+
         for i = 0, 15 do
             M[i] = buffer.readu32(msg, off + i * 4)
         end
@@ -157,33 +167,49 @@ local function computeMD5(data)
 
         for i = 0, 63 do
             local f, g
+
             if i < 16 then
-                f = bor(band(b, c), band(bnot(b), d)); g = i
+                f = bor(band(b, c), band(bnot(b), d))
+                g = i
             elseif i < 32 then
-                f = bor(band(d, b), band(bnot(d), c)); g = (5 * i + 1) % 16
+                f = bor(band(d, b), band(bnot(d), c))
+                g = (5 * i + 1) % 16
             elseif i < 48 then
-                f = bxor(b, c, d); g = (3 * i + 5) % 16
+                f = bxor(b, c, d)
+                g = (3 * i + 5) % 16
             else
-                f = bxor(c, bor(b, bnot(d))); g = (7 * i) % 16
+                f = bxor(c, bor(b, bnot(d)))
+                g = (7 * i) % 16
             end
+
             local tmp = add4(a, f, K[i + 1], M[g])
-            a = d; d = c; c = b
+            a = d
+            d = c
+            c = b
             b = u32add(b, rol(tmp, S[i + 1]))
         end
 
-        A = u32add(A, a); B = u32add(B, b); C = u32add(C, c); D = u32add(D, d)
+        A = u32add(A, a)
+        B = u32add(B, b)
+        C = u32add(C, c)
+        D = u32add(D, d)
     end
 
-    local function bytes(v)
-        return string.char(
-            band(v, 0xFF),
-            band(rshift(v, 8), 0xFF),
-            band(rshift(v, 16), 0xFF),
-            band(rshift(v, 24), 0xFF)
-        )
+    local out = buffer.create(16)
+
+    local function writeWord(offset, value)
+        buffer.writeu8(out, offset, band(value, 0xFF))
+        buffer.writeu8(out, offset + 1, band(rshift(value, 8), 0xFF))
+        buffer.writeu8(out, offset + 2, band(rshift(value, 16), 0xFF))
+        buffer.writeu8(out, offset + 3, band(rshift(value, 24), 0xFF))
     end
 
-    return bytes(A) .. bytes(B) .. bytes(C) .. bytes(D)
+    writeWord(0, A)
+    writeWord(4, B)
+    writeWord(8, C)
+    writeWord(12, D)
+
+    return buffer.tostring(out)
 end
 
 local sharedStrings = {}
@@ -710,13 +736,16 @@ XML_Encoders = {
     Region3int16 = function(raw) return XML_Encoders._minMax(raw.Min,raw.Max,XML_Encoders.Vector3int16) end,
    SharedString = function(raw)
     if #raw < 16 then return nil end
+
     local encoded = XML_Encoders.BinaryString(raw)
     if encoded == "" then return nil end
+
     local id = rawget(sharedStrings, encoded)
     if not id then
         id = base64encode(computeMD5(raw))
         rawset(sharedStrings, encoded, id)
     end
+
     return id
 end,
     SecurityCapabilities = function(raw)
@@ -2500,30 +2529,6 @@ end
             end
         end
     end
-
-do
-    local MIN_SIZES = {
-        MeshData2 = 1,
-        ChildData2 = 1,
-        PhysicalConfigData = 1,
-        CollisionData = 16,
-        PhysicsData = 1,
-        TriangleMeshData = 1,
-    }
-    local tmp = {"<SharedStrings>"}
-    for value, id in sharedStrings do
-        local decoded_len = math.floor(#value * 3 / 4)
-        if string.sub(value, -2) == "==" then decoded_len -= 2
-        elseif string.sub(value, -1) == "=" then decoded_len -= 1 end
-        if decoded_len > 0 then
-            table.insert(tmp, '<SharedString md5="' .. id .. '">' .. value .. "</SharedString>")
-        end
-    end
-    if 1 < #tmp then
-        savebuffer[savebuffer_size] = table.concat(tmp); savebuffer_size += 1
-        savebuffer[savebuffer_size] = "</SharedStrings>"; savebuffer_size += 1
-    end
-end
 
     do
         if OPTIONS.SafeMode then
