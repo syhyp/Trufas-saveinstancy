@@ -116,12 +116,16 @@ local function computeMD5(data)
     local A, B, C, D = 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476
 
     local len = #data
-    local msg = buffer.create(len + 1 + ((55 - len) % 64) + 9)
+    local pad_len = 64 - ((len + 9) % 64)
+    if pad_len == 64 then pad_len = 0 end
+    local total_len = len + 1 + pad_len + 8
+    local msg = buffer.create(total_len)
     buffer.writestring(msg, 0, data)
     buffer.writeu8(msg, len, 0x80)
-    local padded_len = buffer.len(msg) - 8
-    buffer.writeu32(msg, padded_len, band(len * 8, 0xFFFFFFFF))
-    buffer.writeu32(msg, padded_len + 4, 0)
+    local bit_len_lo = band(len * 8, 0xFFFFFFFF)
+    local bit_len_hi = band(math.floor(len / 0x20000000), 0xFFFFFFFF)
+    buffer.writeu32(msg, total_len - 8, bit_len_lo)
+    buffer.writeu32(msg, total_len - 4, bit_len_hi)
 
     local K = {
         0xD76AA478, 0xE8C7B756, 0x242070DB, 0xC1BDCEEE, 0xF57C0FAF, 0x4787C62A, 0xA8304613, 0xFD469501,
