@@ -229,7 +229,7 @@ local service = setmetatable({}, {
     end,
 })
 
-local KeepSharedStrings = { MeshData2 = true, ChildData2 = true, PhysicalConfigData = true }
+local KeepSharedStrings = { MeshData2 = true, ChildData2 = true, PhysicalConfigData = true, CollisionData = true, PhysicsData = true, TriangleMeshData = true }
 local inheritedProperties = {}
 local defaultInstances = {}
 local referents, refSize = setmetatable({}, { __mode = "ks" }), 0
@@ -687,15 +687,16 @@ XML_Encoders = {
     end,
     Region3int16 = function(raw) return XML_Encoders._minMax(raw.Min,raw.Max,XML_Encoders.Vector3int16) end,
     SharedString = function(raw)
-        local encoded = XML_Encoders.BinaryString(raw)
-        if encoded == "" then return "" end
-        local id = rawget(sharedStrings, encoded)
-        if not id then
-            id = computeMD5(raw)
-            rawset(sharedStrings, encoded, id)
-        end
-        return id
-    end,
+    if #raw < 20 then return "" end
+    local encoded = XML_Encoders.BinaryString(raw)
+    if encoded == "" then return "" end
+    local id = rawget(sharedStrings, encoded)
+    if not id then
+        id = computeMD5(raw)
+        rawset(sharedStrings, encoded, id)
+    end
+    return id
+end,
     SecurityCapabilities = function(raw)
         if raw==BASE_CAPABILITIES then return 0 end
         return countCapabilityBits(raw)
