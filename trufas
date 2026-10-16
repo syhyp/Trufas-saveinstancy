@@ -33,7 +33,7 @@ end
 
 local function noteUnsupportedAttribute(typeName)
 	if typeName == "Instance" then
-		typeName = "InstanceHandle (0x25, formato ainda nao implementado)"
+		typeName = "InstanceHandle (0x25, formato ainda nao confirmado; opcao InstanceHandleAttributes)"
 	end
 	logDropped("[atributo nao suportado] " .. tostring(typeName))
 end
@@ -402,6 +402,8 @@ end
 local CLIENT_VERSION = tonumber(string.match(FULL_VERSION, "%d+%.(%d+)")) or 9e9
 local __BREAK = "__BREAK" .. service.HttpService:GenerateGUID(false)
 local USSI_FOLDER = "ussi_cache/"
+local ASSET_FOLDER = "ussi_assets/"
+local CHECKPOINT_FILE = USSI_FOLDER .. "checkpoint.json"
 
 pcall(function()
 	makefolder(USSI_FOLDER)
@@ -453,6 +455,7 @@ local Attribute_Type_Ids = {
 	string = 0x02,
 	boolean = 0x03,
 	int32 = 0x04,
+	float = 0x05,
 	number = 0x06,
 	ValueArray = 0x07,
 	ValueTable = 0x08,
@@ -483,8 +486,9 @@ local Attribute_Type_Ids = {
 	SecurityCapabilities = 0x22,
 	Path2DControlPoint = 0x23,
 	TweenInfo = 0x24,
-	-- 0x25 = InstanceHandle: reservado. Ainda sem encoder (formato do payload nao
-	-- documentado aqui); valores desse tipo sao descartados e registrados no README.
+	-- 0x25 = InstanceHandle: encoder experimental, so ativo com a opcao InstanceHandleAttributes
+	-- (payload assumido como UniqueId de 16 bytes, formato nao confirmado). Fora disso os valores
+	-- desse tipo sao descartados e registrados no README.
 	InstanceHandle = 0x25,
 }
 
@@ -549,6 +553,28 @@ local CAPABILITY_BITS = {
 	Material = 52, AvatarBehavior = 53, RemoteCommand = 59, InternalTest = 60, PluginOrOpenCloud = 61,
 	Assistant = 62, Restricted = 63,
 }
+
+do
+	local ok, items = pcall(function()
+		return Enum.SecurityCapability:GetEnumItems()
+	end)
+	if ok and type(items) == "table" then
+		local consistent, additions = true, {}
+		for _, item in items do
+			local known = CAPABILITY_BITS[item.Name]
+			if known == nil then
+				additions[item.Name] = item.Value
+			elseif known ~= item.Value then
+				consistent = false
+			end
+		end
+		if consistent then
+			for name, value in additions do
+				CAPABILITY_BITS[name] = value
+			end
+		end
+	end
+end
 
 local function capabilityHalves(raw)
 	local rawString = tostring(raw)
@@ -622,6 +648,8 @@ local function cframeToQuaternion(cframe)
 	return qX, qY, qZ, qW
 end
 
+local InstanceHandleEnabled = false
+
 local function classifyTable(t)
 	local len = #t
 	if len == 0 then
@@ -638,6 +666,9 @@ local function resolveTypeName(value)
 	local t = typeof(value)
 	if t == "table" then
 		return classifyTable(value)
+	end
+	if t == "Instance" and InstanceHandleEnabled then
+		return "InstanceHandle"
 	end
 	return t
 end
@@ -858,6 +889,25 @@ local function writeCFrameBody(sbuf, vals, n, optional)
 end
 
 local ContentObjectsEnabled = true
+local ExternalContentPending = {}
+
+local function contentToUri(value)
+	if type(value) == "string" then
+		return value
+	end
+	if typeof(value) == "Content" then
+		local ok, uri = pcall(function()
+			if value.SourceType == Enum.ContentSourceType.Uri then
+				return value.Uri
+			end
+			return nil
+		end)
+		if ok then
+			return uri
+		end
+	end
+	return nil
+end
 
 local Attribute_Encoders
 Attribute_Encoders = {
@@ -929,10 +979,38 @@ Attribute_Encoders = {
 		buffer.writeu8(b, 0, raw and 1 or 0)
 		return b, 1
 	end,
+	["int32"] = function(raw)
+		local b = buffer.create(4)
+		buffer.writei32(b, 0, raw)
+		return b, 4
+	end,
+	["float"] = function(raw)
+		local b = buffer.create(4)
+		buffer.writef32(b, 0, raw)
+		return b, 4
+	end,
 	["number"] = function(raw)
 		local b = buffer.create(8)
 		buffer.writef64(b, 0, raw)
 		return b, 8
+	end,
+	["InstanceHandle"] = function(raw)
+		local b = buffer.create(16)
+		local ok, uid = pcall(function()
+			if gethiddenproperty then
+				return tostring(gethiddenproperty(raw, "UniqueId"))
+			end
+			return tostring(raw.UniqueId)
+		end)
+		if ok then
+			local hex = string.gsub(uid, "[^%x]", "")
+			if #hex == 32 then
+				for i = 0, 15 do
+					buffer.writeu8(b, i, tonumber(string.sub(hex, i * 2 + 1, i * 2 + 2), 16) or 0)
+				end
+			end
+		end
+		return b, 16
 	end,
 	["ValueArray"] = function(raw)
 		local n = 0
@@ -1191,6 +1269,19 @@ do
 	Attribute_Encoders["ColorSequence"] = Attribute_Encoders._makeSequence(Attribute_Encoders["ColorSequenceKeypoint"], 20)
 	Attribute_Encoders._packF32 = Attribute_Encoders._makeVectorPacker(buffer.writef32, 4)
 	Attribute_Encoders._packI16 = Attribute_Encoders._makeVectorPacker(buffer.writei16, 2)
+end
+
+local function assetMapEntries(value)
+	local entries = {}
+	pcall(function()
+		for key, content in value do
+			entries[#entries + 1] = { tostring(key), contentToUri(content) or "" }
+		end
+	end)
+	table.sort(entries, function(a, b)
+		return a[1] < b[1]
+	end)
+	return entries
 end
 
 local Binary_Encoders = {
@@ -1470,6 +1561,9 @@ local Binary_Encoders = {
 						objects[#objects + 1] = ref
 						return zigzag32(2)
 					end
+					if okObj and obj then
+						ExternalContentPending[obj] = true
+					end
 					logDropped("[Content por objeto fora do save] " .. tostring(i))
 				end
 			end
@@ -1487,6 +1581,17 @@ local Binary_Encoders = {
 			end)
 		end
 		sbuf:writeu32(0)
+	end,
+	["AssetContentMap"] = function(sbuf, vals, n)
+		for i = 1, n do
+			local entries = assetMapEntries(vals[i])
+			sbuf:writeu32(#entries)
+			for _, entry in entries do
+				sbuf:writeLenString(entry[1])
+				sbuf:writeu32(entry[2] ~= "" and 1 or 0)
+				sbuf:writeLenString(entry[2])
+			end
+		end
 	end,
 }
 
@@ -3037,6 +3142,7 @@ do
 end
 
 local DECOMPILE_TIMEOUT_MSG = "Tempo limite do decompiler esgotado"
+local DECOMPILE_FAIL_PREFIX = "--[[ Falha ao decompilar"
 local function makeTimeoutHandler(timeout, f, timeoutResult)
 	if timeout < 0 then
 		return function(...)
@@ -3192,6 +3298,344 @@ do
 	mk("Font", function() return Font.new("rbxasset://fonts/families/SourceSansPro.json") end)
 	mk("SecurityCapabilities", function() return SecurityCapabilities.new() end)
 	mk("Content", function() return Content.none end)
+	mk("AssetContentMap", function() return {} end)
+end
+
+local LUA_KEYWORDS = arrayToDict({
+	"and", "break", "do", "else", "elseif", "end", "false", "for", "function", "if", "in",
+	"local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while", "continue",
+})
+
+local function luaNumber(n)
+	if n ~= n then
+		return "(0/0)"
+	elseif n == math.huge then
+		return "math.huge"
+	elseif n == -math.huge then
+		return "-math.huge"
+	elseif n == math.floor(n) and math.abs(n) < 1e15 then
+		return string.format("%d", n)
+	end
+	return string.format("%.9g", n)
+end
+
+local function luaCall(name, ...)
+	local parts = table.pack(...)
+	for i = 1, parts.n do
+		parts[i] = luaNumber(parts[i])
+	end
+	return name .. "(" .. table.concat(parts, ", ") .. ")"
+end
+
+local function sanitizeComment(s)
+	local r = string.gsub(tostring(s), "[%]%[\n\r]", "_")
+	return r
+end
+
+local luaLiteral
+luaLiteral = function(value, depth, seen, budget)
+	depth = depth or 0
+	seen = seen or {}
+	budget = budget or { n = 5000 }
+	budget.n -= 1
+	if budget.n <= 0 then
+		return "nil"
+	end
+	local t = typeof(value)
+	if t == "string" then
+		return string.format("%q", value)
+	elseif t == "number" then
+		return luaNumber(value)
+	elseif t == "boolean" or t == "nil" then
+		return tostring(value)
+	elseif t == "Vector3" then
+		return luaCall("Vector3.new", value.X, value.Y, value.Z)
+	elseif t == "Vector2" then
+		return luaCall("Vector2.new", value.X, value.Y)
+	elseif t == "Color3" then
+		return luaCall("Color3.new", value.R, value.G, value.B)
+	elseif t == "UDim" then
+		return luaCall("UDim.new", value.Scale, value.Offset)
+	elseif t == "UDim2" then
+		return luaCall("UDim2.new", value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
+	elseif t == "CFrame" then
+		return luaCall("CFrame.new", value:GetComponents())
+	elseif t == "EnumItem" then
+		return tostring(value)
+	elseif t == "BrickColor" then
+		return luaCall("BrickColor.new", value.Number)
+	elseif t == "NumberRange" then
+		return luaCall("NumberRange.new", value.Min, value.Max)
+	elseif t == "Instance" then
+		local ok, fullName = pcall(value.GetFullName, value)
+		return "nil --[[" .. sanitizeComment(ok and fullName or "Instance") .. "]]"
+	elseif t == "table" then
+		if seen[value] or depth > 8 then
+			return "nil"
+		end
+		seen[value] = true
+		local keys = {}
+		pcall(function()
+			for k in next, value do
+				local tk = type(k)
+				if tk == "string" or tk == "number" then
+					keys[#keys + 1] = k
+				end
+			end
+		end)
+		table.sort(keys, function(a, b)
+			local ta, tb = type(a), type(b)
+			if ta ~= tb then
+				return ta == "number"
+			end
+			return a < b
+		end)
+		local isArray = true
+		for i, k in keys do
+			if k ~= i then
+				isArray = false
+				break
+			end
+		end
+		local pad = string.rep("\t", depth + 1)
+		local lines = {}
+		for _, k in keys do
+			local item = luaLiteral(rawget(value, k), depth + 1, seen, budget)
+			if isArray then
+				lines[#lines + 1] = pad .. item
+			else
+				local keyText
+				if type(k) == "number" then
+					keyText = "[" .. luaNumber(k) .. "]"
+				elseif not LUA_KEYWORDS[k] and string.match(k, "^[%a_][%w_]*$") then
+					keyText = k
+				else
+					keyText = "[" .. string.format("%q", k) .. "]"
+				end
+				lines[#lines + 1] = pad .. keyText .. " = " .. item
+			end
+		end
+		seen[value] = nil
+		if #lines == 0 then
+			return "{}"
+		end
+		return "{\n" .. table.concat(lines, ",\n") .. ",\n" .. string.rep("\t", depth) .. "}"
+	end
+	return "nil"
+end
+
+local CRC_TABLE = {}
+for i = 0, 255 do
+	local c = i
+	for _ = 1, 8 do
+		if bit32.band(c, 1) == 1 then
+			c = bit32.bxor(0xEDB88320, bit32.rshift(c, 1))
+		else
+			c = bit32.rshift(c, 1)
+		end
+	end
+	CRC_TABLE[i] = c
+end
+
+local function crc32Buffer(b, offset, length)
+	local crc = 0xFFFFFFFF
+	local rshift, bxor, band = bit32.rshift, bit32.bxor, bit32.band
+	local ru8 = buffer.readu8
+	for i = offset, offset + length - 1 do
+		crc = bxor(CRC_TABLE[band(bxor(crc, ru8(b, i)), 0xFF)], rshift(crc, 8))
+	end
+	return bxor(crc, 0xFFFFFFFF)
+end
+
+local function writeBE32(b, offset, v)
+	buffer.writeu8(b, offset, bit32.rshift(v, 24))
+	buffer.writeu8(b, offset + 1, bit32.band(bit32.rshift(v, 16), 0xFF))
+	buffer.writeu8(b, offset + 2, bit32.band(bit32.rshift(v, 8), 0xFF))
+	buffer.writeu8(b, offset + 3, bit32.band(v, 0xFF))
+end
+
+local function pngChunk(typeAndData)
+	local len = buffer.len(typeAndData) - 4
+	local out = buffer.create(len + 12)
+	writeBE32(out, 0, len)
+	buffer.copy(out, 4, typeAndData)
+	writeBE32(out, len + 8, crc32Buffer(typeAndData, 0, len + 4))
+	return buffer.tostring(out)
+end
+
+local function encodePNG(width, height, pixels)
+	local rowLen = width * 4
+	local rawLen = (rowLen + 1) * height
+	local raw = buffer.create(rawLen)
+	for y = 0, height - 1 do
+		buffer.copy(raw, y * (rowLen + 1) + 1, pixels, y * rowLen, rowLen)
+	end
+	local blocks = math.max(1, math.ceil(rawLen / 65535))
+	local idat = buffer.create(4 + 2 + rawLen + blocks * 5 + 4)
+	buffer.writestring(idat, 0, "IDAT")
+	buffer.writeu8(idat, 4, 0x78)
+	buffer.writeu8(idat, 5, 0x01)
+	local o, pos = 6, 0
+	for blockIndex = 1, blocks do
+		local len = math.min(65535, rawLen - pos)
+		buffer.writeu8(idat, o, blockIndex == blocks and 1 or 0)
+		buffer.writeu16(idat, o + 1, len)
+		buffer.writeu16(idat, o + 3, bit32.bxor(len, 0xFFFF))
+		buffer.copy(idat, o + 5, raw, pos, len)
+		o += 5 + len
+		pos += len
+	end
+	local a, b = 1, 0
+	for i = 0, rawLen - 1 do
+		a = (a + buffer.readu8(raw, i)) % 65521
+		b = (b + a) % 65521
+	end
+	writeBE32(idat, o, b * 65536 + a)
+	local ihdr = buffer.create(17)
+	buffer.writestring(ihdr, 0, "IHDR")
+	writeBE32(ihdr, 4, width)
+	writeBE32(ihdr, 8, height)
+	buffer.writeu8(ihdr, 12, 8)
+	buffer.writeu8(ihdr, 13, 6)
+	local iend = buffer.create(4)
+	buffer.writestring(iend, 0, "IEND")
+	return "\137PNG\r\n\26\n" .. pngChunk(ihdr) .. pngChunk(idat) .. pngChunk(iend)
+end
+
+local function meshToObj(mesh)
+	local lines = {}
+	local indexOf = {}
+	for i, id in mesh:GetVertices() do
+		local p = mesh:GetPosition(id)
+		indexOf[id] = i
+		lines[#lines + 1] = string.format("v %.6f %.6f %.6f", p.X, p.Y, p.Z)
+	end
+	for _, face in mesh:GetFaces() do
+		local parts = {}
+		for _, id in mesh:GetFaceVertices(face) do
+			parts[#parts + 1] = tostring(indexOf[id] or 0)
+		end
+		if #parts >= 3 then
+			lines[#lines + 1] = "f " .. table.concat(parts, " ")
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
+local function cheapHash(s)
+	local n = #s
+	local h1, h2 = 5381, n
+	local step = math.max(1, n // 4096)
+	for i = 1, n, step do
+		local c = string.byte(s, i)
+		h1 = (h1 * 33 + c) % 4294967296
+		h2 = (h2 * 131 + c) % 4294967296
+	end
+	return string.format("%08x%08x%x", h1, h2, n)
+end
+
+local function lowerFirst(s)
+	return string.lower(string.sub(s, 1, 1)) .. string.sub(s, 2)
+end
+
+local function deriveVariableName(rhs)
+	local svc = string.match(rhs, ":GetService%(\"([%w_]+)\"%)")
+	if svc then
+		return svc
+	end
+	local class = string.match(rhs, "^Instance%.new%(\"([%w_]+)\"")
+	if class then
+		return lowerFirst(class)
+	end
+	local child = string.match(rhs, ":WaitForChild%(\"([%w_ ]+)\"") or string.match(rhs, ":FindFirstChild%(\"([%w_ ]+)\"")
+	if child then
+		return lowerFirst(child)
+	end
+	local prop = string.match(rhs, "^[%a_][%w_]*%.([%a_][%w_]*)$")
+	if prop then
+		return lowerFirst(prop)
+	end
+	return nil
+end
+
+local function postProcessSource(source)
+	if #source > 600000 then
+		return source
+	end
+	local stripped = string.gsub(string.gsub(source, '"[^"\n]*"', '""'), "'[^'\n]*'", "''")
+	local used = {}
+	string.gsub(stripped, "()([%a_][%w_]*)", function(pos, word)
+		local prev = string.sub(stripped, pos - 1, pos - 1)
+		if prev ~= "." and prev ~= ":" then
+			used[word] = true
+		end
+		return nil
+	end)
+	local renames = {}
+	local function claim(old, base)
+		if renames[old] or not base then
+			return
+		end
+		base = string.gsub(base, "[^%w_]", "")
+		if base == "" or string.match(base, "^%d") then
+			return
+		end
+		local candidate, n = base, 1
+		while used[candidate] or LUA_KEYWORDS[candidate] do
+			n += 1
+			candidate = base .. n
+		end
+		used[candidate] = true
+		renames[old] = candidate
+	end
+	local generic = {}
+	for word in used do
+		if string.match(word, "^l_[%w_]+_%d+$") then
+			generic[#generic + 1] = word
+		end
+	end
+	table.sort(generic)
+	for _, word in generic do
+		claim(word, string.match(word, "^l_([%w_]+)_%d+$"))
+	end
+	for line in string.gmatch(source, "[^\n]+") do
+		local name, rhs = string.match(line, "^%s*local ([%a_][%w_]*) = (.+)$")
+		if name and not renames[name] and string.match(name, "^[vpu]%d+$") then
+			claim(name, deriveVariableName(rhs))
+		end
+	end
+	if next(renames) == nil then
+		return source
+	end
+	local result = string.gsub(source, "()([%a_][%w_]*)", function(pos, word)
+		local replacement = renames[word]
+		if not replacement then
+			return nil
+		end
+		local prev = string.sub(source, pos - 1, pos - 1)
+		if (prev == "." or prev == ":") and string.sub(source, pos - 2, pos - 1) ~= ".." then
+			return nil
+		end
+		return replacement
+	end)
+	return result
+end
+
+local TERRAIN_MATERIAL_INDEX = {}
+do
+	local names = {
+		"Air", "Water", "Grass", "Slate", "Concrete", "Brick", "Sand", "WoodPlanks", "Rock", "Glacier", "Snow",
+		"Sandstone", "Mud", "Basalt", "Ground", "CrackedLava", "Asphalt", "Cobblestone", "Ice", "LeafyGrass",
+		"Salt", "Limestone", "Pavement",
+	}
+	for i, name in names do
+		local ok, item = pcall(function()
+			return Enum.Material[name]
+		end)
+		if ok and item then
+			TERRAIN_MATERIAL_INDEX[item] = i - 1
+		end
+	end
 end
 
 local function synsaveinstance(...)
@@ -3207,6 +3651,34 @@ local function synsaveinstance(...)
 	local validationNote = ""
 	local AttemptLog = {}
 	table.clear(DroppedLog)
+	table.clear(ExternalContentPending)
+
+	local Stats = {
+		instances = 0,
+		scripts = 0,
+		scriptsOk = 0,
+		scriptsFailed = 0,
+		scriptsEmpty = 0,
+		scriptsServer = 0,
+		scriptsSkipped = 0,
+		modulesExtracted = 0,
+		constantsAppended = 0,
+		meshParts = 0,
+		meshPartsNoMesh = 0,
+		terrain = "nao lido",
+		terrainSource = false,
+		skipped = {},
+		sweepPoints = 0,
+		accumulated = 0,
+		editableImages = 0,
+		editableMeshes = 0,
+		gcInstances = 0,
+		gcTables = 0,
+		remotes = 0,
+		externalContent = 0,
+		assetsDownloaded = 0,
+		assetsFailed = 0,
+	}
 
 	local OPTIONS = {
 		mode = "optimized",
@@ -3236,6 +3708,7 @@ local function synsaveinstance(...)
 		Watermark = false,
 		KillAllScripts = true,
 		SafeMode = true,
+		SafeModeDelay = 0,
 		BoostFPS = false,
 		ShutdownWhenDone = false,
 		AntiIdle = true,
@@ -3249,6 +3722,7 @@ local function synsaveinstance(...)
 		IgnoreNotArchivable = true,
 		IgnorePropertiesOfNotScriptsOnScriptsMode = false,
 		IgnoreSpecialProperties = IS_WEAK_EXECUTOR or false,
+		SpecialProperties = true,
 		IsolateLocalPlayer = false,
 		IsolateLocalPlayerCharacter = false,
 		IsolatePlayers = false,
@@ -3285,6 +3759,46 @@ local function synsaveinstance(...)
 		AutoRetry = true,
 		DeleteInvalidFile = true,
 		ContentObjects = true,
+		ExternalContentPass = true,
+		StreamingSweep = true,
+		SweepStep = false,
+		SweepWait = 0.4,
+		SweepBounds = false,
+		SweepMaxPoints = 400,
+		SweepMaxExtent = 20000,
+		Accumulate = true,
+		AccumulateLimit = 30000,
+		AccumulateDestroyed = false,
+		TerrainFallback = true,
+		TerrainBounds = false,
+		TerrainScanRadius = 1024,
+		TerrainReadRadius = 512,
+		TerrainSlots = true,
+		Resume = true,
+		CheckpointInterval = 40,
+		InstanceHandleAttributes = false,
+		AssetContentMapEncoder = false,
+		ExportEditable = true,
+		EditableMaxPixels = 4194304,
+		ExtractModules = true,
+		ModuleTimeout = 3,
+		AppendConstants = true,
+		PostProcessDecompile = true,
+		ScanGC = false,
+		GCTableLimit = 200,
+		RemoteLog = false,
+		RemoteLogLimit = 2000,
+		DownloadAssets = false,
+		AssetDownloadLimit = 200,
+		AssetMaxBytes = 8388608,
+		AssetListFile = true,
+		CompletenessReport = true,
+		ProbeWrite = true,
+		ModeProfiles = {
+			full = { IgnoreDefaultProperties = false },
+			scripts = { StreamingSweep = false, Accumulate = false, ExportEditable = false, TerrainFallback = false, TerrainSlots = false },
+			optimized = {},
+		},
 		OptionsAliases = {
 			Clipboard = "CopyToClipboard",
 			DecompileScripts = "Decompile",
@@ -3313,6 +3827,8 @@ local function synsaveinstance(...)
 		},
 	}
 	local OPTIONS_lowercase, OptionsAliasesInverse_lowercase, CustomOptions_valid = {}, {}, {}
+	local AliasesLowercase = {}
+	local partialSave = false
 
 	do
 		local function buildMap(dest, source, warnLabel)
@@ -3335,6 +3851,9 @@ local function synsaveinstance(...)
 		end
 		buildMap(OPTIONS_lowercase, OPTIONS.OptionsAliases, "ALIAS")
 		buildMap(OptionsAliasesInverse_lowercase, OPTIONS.OptionsAliasesInverse, "ALIAS INVERSO")
+		for k in OPTIONS.OptionsAliases do
+			AliasesLowercase[string.lower(k)] = true
+		end
 	end
 
 	do
@@ -3369,7 +3888,6 @@ local function synsaveinstance(...)
 
 		local args = table.pack(...)
 		local directInstances = false
-		local partialSave = false
 		for i = 1, args.n do
 			local arg = args[i]
 			local Type = typeof(arg)
@@ -3380,6 +3898,7 @@ local function synsaveinstance(...)
 					directInstances = true
 					partialSave = true
 				else
+					local pendingOptions = {}
 					for key, value in arg do
 						if type(key) ~= "string" then
 							warn("Nomes de opcao devem ser strings:", key)
@@ -3388,18 +3907,35 @@ local function synsaveinstance(...)
 						local k = string.lower(key)
 						local option = OPTIONS_lowercase[k]
 						local invert = false
+						local isAlias = AliasesLowercase[k] ~= nil
 						if not option then
 							option = OptionsAliasesInverse_lowercase[k]
 							invert = option ~= nil
+							isAlias = invert
 						end
 						if option then
-							if invert then
-								OPTIONS[option] = not value
-							else
-								OPTIONS[option] = value
-							end
-							CustomOptions_valid[option] = true
+							pendingOptions[#pendingOptions + 1] = {
+								option = option,
+								value = value,
+								invert = invert,
+								alias = isAlias,
+								key = k,
+							}
 						end
+					end
+					table.sort(pendingOptions, function(a, b)
+						if a.alias ~= b.alias then
+							return a.alias
+						end
+						return a.key < b.key
+					end)
+					for _, pending in pendingOptions do
+						if pending.invert then
+							OPTIONS[pending.option] = not pending.value
+						else
+							OPTIONS[pending.option] = pending.value
+						end
+						CustomOptions_valid[pending.option] = true
 					end
 				end
 			elseif Type == "Instance" then
@@ -3424,6 +3960,51 @@ local function synsaveinstance(...)
 			end
 		end
 	end
+
+	local effectiveMode = string.lower(OPTIONS.mode)
+	if OPTIONS.Object == game then
+		effectiveMode = "full"
+	end
+
+	do
+		local profiles = OPTIONS.ModeProfiles
+		local profile = type(profiles) == "table" and profiles[effectiveMode]
+		if type(profile) == "table" then
+			for key, value in profile do
+				if CustomOptions_valid[key] == nil then
+					OPTIONS[key] = value
+				end
+			end
+		end
+	end
+
+	do
+		local safeMode = OPTIONS.SafeMode
+		if type(safeMode) == "function" or safeMode == "auto" then
+			local streaming = false
+			pcall(function()
+				streaming = workspace.StreamingEnabled
+			end)
+			local sweeping = OPTIONS.StreamingSweep and true or false
+			if type(safeMode) == "function" then
+				local ok, result = pcall(safeMode, {
+					StreamingEnabled = streaming,
+					StreamingSweep = sweeping,
+					Accumulate = OPTIONS.Accumulate and true or false,
+					PlaceId = game.PlaceId,
+					Executor = EXECUTOR_NAME,
+					Mode = effectiveMode,
+					Partial = partialSave,
+				})
+				OPTIONS.SafeMode = ok and result and true or false
+			else
+				OPTIONS.SafeMode = (not streaming) or sweeping
+			end
+		end
+	end
+
+	InstanceHandleEnabled = OPTIONS.InstanceHandleAttributes == true
+	Type_Ids.AssetContentMap = OPTIONS.AssetContentMapEncoder and 35 or nil
 
 	if not writefile and not (OPTIONS.Callback or OPTIONS.CopyToClipboard) then
 		local msg = 'Funcao "writefile" NAO disponivel. Use a opcao "Callback".'
@@ -3484,6 +4065,14 @@ local function synsaveinstance(...)
 	local ClassSerializableCache = {}
 	local ReflectionUsable
 	local HasAutoRemaps
+	local SourceClasses = {}
+
+	local function hasSource(instance)
+		if instance:IsA("LuaSourceContainer") then
+			return true
+		end
+		return SourceClasses[instance.ClassName] == true
+	end
 
 	local DecompileIgnore, IgnoreList, IgnoreProperties, NotCreatableFixes =
 		arrayToDict(OPTIONS.DecompileIgnore, true),
@@ -3505,6 +4094,54 @@ local function synsaveinstance(...)
 	local __DEBUG_MODE = OPTIONS.__DEBUG_MODE
 	if __DEBUG_MODE and type(__DEBUG_MODE) ~= "function" then
 		__DEBUG_MODE = warn
+	end
+
+	local SpecialMode, SpecialAllow, SpecialDeny = "all", nil, nil
+	do
+		local special = OPTIONS.SpecialProperties
+		if OPTIONS.IgnoreSpecialProperties or special == false then
+			SpecialMode = "none"
+		elseif type(special) == "table" then
+			SpecialMode = "list"
+			SpecialAllow, SpecialDeny = {}, {}
+			for key, value in special do
+				if type(key) == "number" then
+					SpecialAllow[value] = true
+				elseif value == false then
+					SpecialDeny[key] = true
+				else
+					SpecialAllow[key] = true
+				end
+			end
+		end
+	end
+	local SpecialCache = {}
+
+	local function specialAllowed(instance, name)
+		if SpecialMode ~= "list" then
+			return true
+		end
+		local className = instance.ClassName
+		local key = className .. "." .. name
+		local cached = SpecialCache[key]
+		if cached ~= nil then
+			return cached
+		end
+		local allowed = SpecialAllow[name] or SpecialAllow[key] or SpecialAllow["*"] or false
+		if not allowed then
+			for entry in SpecialAllow do
+				local cls, prop = string.match(entry, "^([^%.]+)%.(.+)$")
+				if cls and prop == name and (cls == "*" or instance:IsA(cls)) then
+					allowed = true
+					break
+				end
+			end
+		end
+		if SpecialDeny[name] or SpecialDeny[key] then
+			allowed = false
+		end
+		SpecialCache[key] = allowed
+		return allowed
 	end
 
 	local LP_UserId, LP_Name, ANON_UserId, ANON_Name, Anonymizers
@@ -3610,10 +4247,6 @@ local function synsaveinstance(...)
 		IsModel = nil
 	end
 
-	local function isLuaSourceContainer(instance)
-		return instance:IsA("LuaSourceContainer")
-	end
-
 	local function sanitizeFileName(str)
 		return string.sub(string.gsub(string.gsub(string.gsub(str, "[^%w _]", ""), " +", " "), " +$", ""), 1, 240)
 	end
@@ -3696,7 +4329,7 @@ local function synsaveinstance(...)
 		elseif mode == "scripts" then
 			local unique = {}
 			for _, instance in TempRoot:GetDescendants() do
-				if isLuaSourceContainer(instance) then
+				if hasSource(instance) then
 					local Parent = instance.Parent
 					while Parent and Parent ~= TempRoot do
 						instance = instance.Parent
@@ -3714,6 +4347,56 @@ local function synsaveinstance(...)
 		ToSaveList = tmp
 		if Object then
 			table.insert(ToSaveList, 1, Object)
+		end
+	end
+
+	do
+		local probeOk = true
+		if OPTIONS.ProbeWrite and not (CopyToClipboard or Callback) then
+			local path = USSI_FOLDER .. "write_probe.tmp"
+			local ok, err = pcall(writefile, path, "ussi")
+			if not ok then
+				warn("[USSI] Probe de escrita falhou (writefile):", err)
+				probeOk = false
+			elseif OPTIONS.AlternativeWritefile then
+				if not appendfile then
+					OPTIONS.AlternativeWritefile = false
+				else
+					local okAppend = pcall(appendfile, path, "-probe")
+					local okRead, data = pcall(function()
+						return readfile and readfile(path) or nil
+					end)
+					if not okAppend or (okRead and data ~= nil and data ~= "ussi-probe") then
+						warn("[USSI] appendfile instavel neste executor; usando writefile")
+						OPTIONS.AlternativeWritefile = false
+					end
+				end
+			end
+			if delfile then
+				pcall(delfile, path)
+			end
+		end
+		if not probeOk then
+			GLOBAL_ENV[guardKey] = nil
+			stopWatermark()
+			return
+		end
+	end
+
+	if OPTIONS.Resume and isfile and readfile and isfile(CHECKPOINT_FILE) then
+		local ok, data = pcall(function()
+			return service.HttpService:JSONDecode(readfile(CHECKPOINT_FILE))
+		end)
+		if ok and type(data) == "table" and data.placeId == game.PlaceId then
+			warn(
+				string.format(
+					"[USSI] Checkpoint anterior encontrado (fase %s, %s/%s itens, %s scripts). Cache de scripts e estado do gethiddenproperty serao reaproveitados.",
+					tostring(data.stage),
+					tostring(data.processed),
+					tostring(data.total),
+					tostring(data.scripts)
+				)
+			)
 		end
 	end
 
@@ -3767,6 +4450,25 @@ local function synsaveinstance(...)
 		return string.format("~%.0fs", remaining)
 	end
 
+	local function writeCheckpoint(stage)
+		if not (OPTIONS.Resume and writefile) then
+			return
+		end
+		pcall(
+			writefile,
+			CHECKPOINT_FILE,
+			service.HttpService:JSONEncode({
+				placeId = game.PlaceId,
+				file = placename,
+				stage = stage,
+				processed = processed,
+				total = totalWork,
+				scripts = Stats.scripts,
+				time = os.time(),
+			})
+		)
+	end
+
 	local function wait_for_render()
 		pcall(task.wait)
 		lastYield = os.clock()
@@ -3811,6 +4513,7 @@ local function synsaveinstance(...)
 		phaseStart = os.clock()
 		lastPulse = 0
 		refreshStatus()
+		writeCheckpoint(name)
 	end
 
 	local function ensureSpinner()
@@ -3890,8 +4593,9 @@ local function synsaveinstance(...)
 	local DISK_CACHE_SCHEMA = 2
 	local DISK_CACHE_KEY = EXECUTOR_NAME .. "@" .. EXECUTOR_VERSION .. "#" .. DISK_CACHE_SCHEMA
 	local DISK_CACHE_TTL = (EXECUTOR_VERSION ~= "" and 14 or 3) * 86400
-	local diskCacheEnabled = OPTIONS.DecompileCache and OPTIONS.Decompile and getscripthash and readfile and writefile and isfile and true or false
+	local diskCacheEnabled = OPTIONS.DecompileCache and OPTIONS.Decompile and (getscripthash or getscriptbytecode) and readfile and writefile and isfile and true or false
 	local diskCache, diskCacheAll, diskCacheDirty, diskCacheSize = {}, {}, false, 0
+	local decompiledSinceFlush = 0
 
 	local function evictDiskCache(targetFraction)
 		local target = DISK_CACHE_LIMIT * targetFraction
@@ -3948,10 +4652,15 @@ local function synsaveinstance(...)
 		end
 	end
 
-	local function scriptHash(script)
-		local ok, h = pcall(getscripthash, script)
-		if ok and type(h) == "string" and h ~= "" then
-			return h
+	local function scriptHash(script, bytecode)
+		if getscripthash then
+			local ok, h = pcall(getscripthash, script)
+			if ok and type(h) == "string" and h ~= "" then
+				return h
+			end
+		end
+		if bytecode and bytecode ~= "" then
+			return cheapHash(bytecode)
 		end
 	end
 
@@ -3993,7 +4702,7 @@ local function synsaveinstance(...)
 				end
 			end
 			if diskCacheEnabled then
-				hash = scriptHash(script)
+				hash = scriptHash(script, bytecode)
 				local stored = hash and diskCache[hash]
 				if stored then
 					local now = os.time()
@@ -4024,7 +4733,7 @@ local function synsaveinstance(...)
 				result = string.gsub(result, "\0", "\\0")
 				output = result
 			else
-				output = "--[[ Falha ao decompilar. Motivo:\n" .. tostring(result or "") .. "\n]]"
+				output = DECOMPILE_FAIL_PREFIX .. ". Motivo:\n" .. tostring(result or "") .. "\n]]"
 			end
 			if ScriptCache and bytecode then
 				ldeccache[bytecode] = output
@@ -4036,6 +4745,12 @@ local function synsaveinstance(...)
 				if diskCacheSize > DISK_CACHE_LIMIT * 1.25 then
 					evictDiskCache(0.8)
 				end
+				decompiledSinceFlush += 1
+				if decompiledSinceFlush >= OPTIONS.CheckpointInterval then
+					decompiledSinceFlush = 0
+					flushDiskCache()
+					writeCheckpoint(phase)
+				end
 			end
 			return output
 		end
@@ -4043,6 +4758,110 @@ local function synsaveinstance(...)
 		ldecompile = function()
 			return "-- Seu executor NAO possui decompiler"
 		end
+	end
+
+	local debugLibrary = debug
+	local getconstantsFn = (debugLibrary and debugLibrary.getconstants) or getconstants
+	local getprotosFn = (debugLibrary and debugLibrary.getprotos) or getprotos
+	local getupvaluesFn = (debugLibrary and debugLibrary.getupvalues) or getupvalues
+	local getscriptclosureFn = getscriptclosure or getscriptfunction
+
+	local function constantsReport(script)
+		if not (OPTIONS.AppendConstants and getscriptclosureFn and getconstantsFn) then
+			return nil
+		end
+		local okClosure, closure = pcall(getscriptclosureFn, script)
+		if not okClosure or type(closure) ~= "function" then
+			return nil
+		end
+		local seen, lines, visited = {}, {}, 0
+		local function addLiteral(value)
+			local t = type(value)
+			if (t == "string" or t == "number" or t == "boolean") and #lines < 600 then
+				local key = t .. ":" .. tostring(value)
+				if not seen[key] then
+					seen[key] = true
+					lines[#lines + 1] = luaLiteral(value)
+				end
+			end
+		end
+		local function collectFrom(fn, depth)
+			if depth > 4 or visited > 200 then
+				return
+			end
+			visited += 1
+			local okC, constants = pcall(getconstantsFn, fn)
+			if okC and type(constants) == "table" then
+				for _, constant in constants do
+					addLiteral(constant)
+				end
+			end
+			if getupvaluesFn then
+				local okU, upvalues = pcall(getupvaluesFn, fn)
+				if okU and type(upvalues) == "table" then
+					for _, upvalue in upvalues do
+						addLiteral(upvalue)
+					end
+				end
+			end
+			if getprotosFn then
+				local okP, protos = pcall(getprotosFn, fn)
+				if okP and type(protos) == "table" then
+					for _, proto in protos do
+						if type(proto) == "function" then
+							collectFrom(proto, depth + 1)
+						end
+					end
+				end
+			end
+		end
+		collectFrom(closure, 0)
+		if #lines == 0 then
+			return nil
+		end
+		Stats.constantsAppended += 1
+		local body = string.gsub(table.concat(lines, "\n"), "%]==%]", "] == ]")
+		return "--[==[ Constantes e upvalues recuperados do bytecode (" .. #lines .. "):\n" .. body .. "\n]==]"
+	end
+
+	local function extractModuleSource(module)
+		if not OPTIONS.ExtractModules or not module:IsA("ModuleScript") then
+			return nil
+		end
+		local requireModule = makeTimeoutHandler(OPTIONS.ModuleTimeout, require, "timeout")
+		local ok, result = requireModule(module)
+		if not ok then
+			return nil
+		end
+		Stats.modulesExtracted += 1
+		return "-- Valor retornado por require() em tempo de execucao\nreturn " .. luaLiteral(result)
+	end
+
+	local function finalizeSource(instance, value)
+		if string.sub(value, 1, #DECOMPILE_FAIL_PREFIX) == DECOMPILE_FAIL_PREFIX then
+			Stats.scriptsFailed += 1
+			local recovered = extractModuleSource(instance)
+			local constants = constantsReport(instance)
+			local result = value
+			if constants then
+				result = constants .. "\n\n" .. result
+			end
+			if recovered then
+				result = recovered .. "\n\n" .. result
+			end
+			return result
+		elseif value == "-- O script esta vazio" then
+			Stats.scriptsEmpty += 1
+			return value
+		end
+		Stats.scriptsOk += 1
+		if OPTIONS.PostProcessDecompile and string.sub(value, 1, 2) ~= "--" then
+			local ok, processed_value = pcall(postProcessSource, value)
+			if ok and type(processed_value) == "string" then
+				return processed_value
+			end
+		end
+		return value
 	end
 
 	local function filterLinkedSource(str)
@@ -4054,7 +4873,9 @@ local function synsaveinstance(...)
 	end
 
 	local function sourceFor(instance, ldIgnoring)
+		Stats.scripts += 1
 		if ldIgnoring then
+			Stats.scriptsSkipped += 1
 			return "-- Ignorado"
 		end
 		local value
@@ -4105,6 +4926,13 @@ local function synsaveinstance(...)
 				warn("Falha ao extrair LinkedSource:", instance:GetFullName(), LinkedSource_Url)
 			end
 		end
+		if should_decompile and not instance:IsA("LuaSourceContainer") then
+			local okSource, direct = pcall(index, instance, "Source")
+			if okSource and type(direct) == "string" and direct ~= "" then
+				value = direct
+				should_decompile = nil
+			end
+		end
 		if should_decompile then
 			local isLocalScript = instance:IsA("LocalScript")
 			if
@@ -4112,8 +4940,9 @@ local function synsaveinstance(...)
 				or not isLocalScript and instance:IsA("Script") and instance.RunContext ~= Enum.RunContext.Client
 			then
 				value = "-- [FilteringEnabled] Scripts de servidor sao IMPOSSIVEIS de salvar"
+				Stats.scriptsServer += 1
 			else
-				value = ldecompile(instance)
+				value = finalizeSource(instance, ldecompile(instance))
 				if SaveBytecode then
 					local output = SaveBytecode(instance)
 					if output then
@@ -4121,6 +4950,8 @@ local function synsaveinstance(...)
 					end
 				end
 			end
+		else
+			Stats.scriptsOk += 1
 		end
 		return "-- Salvo por " .. CREDITS .. "\n\n"
 			.. (hasLinkedSource and "-- Fonte original: https://assetdelivery.roblox.com/v1/asset/?" .. (LinkedSource_type or "id") .. "=" .. (LinkedSource or LinkedSource_Url) .. "\n\n" or "")
@@ -4304,6 +5135,170 @@ local function synsaveinstance(...)
 		end
 	end
 
+	local SweepRan = false
+	local SweepOrigin = Vector3.zero
+	local TerrainChunks = {}
+	local TerrainChunkCount = 0
+	local TerrainBlobCache
+
+	local function encodeTerrainChunk(matGrid, occGrid, cx, cy, cz)
+		local parts = { string.pack("<i4i4i4", cx, cy, cz) }
+		local runMaterial, runOccupancy, runCount = 0, 0, 0
+		local function flush()
+			if runCount == 0 then
+				return
+			end
+			local explicit = runMaterial ~= 0 and runOccupancy < 255
+			local header = runMaterial + (explicit and 0x40 or 0) + (runCount > 1 and 0x80 or 0)
+			local piece = string.char(header)
+			if explicit then
+				piece ..= string.char(runOccupancy)
+			end
+			if runCount > 1 then
+				piece ..= string.char(runCount - 1)
+			end
+			parts[#parts + 1] = piece
+			runCount = 0
+		end
+		for y = 1, 32 do
+			for z = 1, 32 do
+				for x = 1, 32 do
+					local material = TERRAIN_MATERIAL_INDEX[matGrid[x][y][z]] or 0
+					local occupancy = 0
+					if material ~= 0 then
+						occupancy = math.clamp(math.floor(occGrid[x][y][z] * 255 + 0.5), 0, 255)
+					end
+					if runCount > 0 and material == runMaterial and occupancy == runOccupancy and runCount < 256 then
+						runCount += 1
+					else
+						flush()
+						runMaterial, runOccupancy, runCount = material, occupancy, 1
+					end
+				end
+			end
+		end
+		flush()
+		return table.concat(parts)
+	end
+
+	local function readTerrainChunk(terrain, cx, cy, cz)
+		local key = cx .. ":" .. cy .. ":" .. cz
+		if type(TerrainChunks[key]) == "table" then
+			return
+		end
+		local min = Vector3.new(cx * 128, cy * 128, cz * 128)
+		local ok, matGrid, occGrid = pcall(terrain.ReadVoxels, terrain, Region3.new(min, min + Vector3.new(128, 128, 128)), 4)
+		if not ok or type(matGrid) ~= "table" or type(occGrid) ~= "table" then
+			TerrainChunks[key] = false
+			return
+		end
+		local any = false
+		for x = 1, 32 do
+			local plane = matGrid[x]
+			for y = 1, 32 do
+				local column = plane[y]
+				for z = 1, 32 do
+					if column[z] ~= Enum.Material.Air then
+						any = true
+						break
+					end
+				end
+				if any then
+					break
+				end
+			end
+			if any then
+				break
+			end
+		end
+		if not any then
+			TerrainChunks[key] = false
+			return
+		end
+		local okEncode, data = pcall(encodeTerrainChunk, matGrid, occGrid, cx, cy, cz)
+		if okEncode then
+			TerrainChunks[key] = { cx = cx, cy = cy, cz = cz, data = data }
+			TerrainChunkCount += 1
+		else
+			TerrainChunks[key] = false
+		end
+		pulse()
+	end
+
+	local function terrainSmoothGrid(terrain)
+		if not OPTIONS.TerrainFallback then
+			return nil
+		end
+		local bounds = OPTIONS.TerrainBounds
+		local minV, maxV
+		if type(bounds) == "table" and bounds.Min and bounds.Max then
+			minV, maxV = bounds.Min, bounds.Max
+		else
+			local radius = OPTIONS.TerrainScanRadius
+			minV = SweepOrigin - Vector3.new(radius, radius / 2, radius)
+			maxV = SweepOrigin + Vector3.new(radius, radius / 2, radius)
+		end
+		for cx = math.floor(minV.X / 128), math.floor(maxV.X / 128) do
+			for cy = math.floor(minV.Y / 128), math.floor(maxV.Y / 128) do
+				for cz = math.floor(minV.Z / 128), math.floor(maxV.Z / 128) do
+					readTerrainChunk(terrain, cx, cy, cz)
+				end
+			end
+		end
+		local list = {}
+		for _, record in TerrainChunks do
+			if type(record) == "table" then
+				list[#list + 1] = record
+			end
+		end
+		if #list == 0 then
+			return nil
+		end
+		table.sort(list, function(a, b)
+			if a.cy ~= b.cy then
+				return a.cy < b.cy
+			elseif a.cz ~= b.cz then
+				return a.cz < b.cz
+			end
+			return a.cx < b.cx
+		end)
+		local pieces = table.create(#list + 1)
+		pieces[1] = "\1\5"
+		for i, record in list do
+			pieces[i + 1] = record.data
+		end
+		Stats.terrain = "reconstruido via ReadVoxels (" .. #list .. " chunks)"
+		Stats.terrainSource = true
+		return table.concat(pieces)
+	end
+
+	local function terrainBlobFor(instance)
+		if not OPTIONS.TerrainFallback or instance.ClassName ~= "Terrain" then
+			return nil
+		end
+		if TerrainBlobCache == nil then
+			TerrainBlobCache = terrainSmoothGrid(instance) or false
+		end
+		return TerrainBlobCache or nil
+	end
+
+	local function noteTerrain(value)
+		if Stats.terrainSource then
+			return
+		end
+		Stats.terrain = (type(value) == "string" and #value > 0) and "ok (propriedade lida)" or "VAZIO (SmoothGrid ilegivel)"
+	end
+
+	local function breakOrTerrain(instance, propertyName)
+		if propertyName == "SmoothGrid" then
+			local blob = terrainBlobFor(instance)
+			if blob then
+				return blob
+			end
+		end
+		return __BREAK
+	end
+
 	local function readProperty(instance, property)
 		local PropertyName, ValueType, CanRead, Special = property.Name, property.ValueType, property.CanRead, property.Special
 
@@ -4330,11 +5325,19 @@ local function synsaveinstance(...)
 			end
 		end
 
-		if ValueType == "ProtectedString" and PropertyName == "Source" and isLuaSourceContainer(instance) then
+		if PropertyName == "SmoothGrid" and (SweepRan or OPTIONS.TerrainFallback == "always") then
+			local blob = terrainBlobFor(instance)
+			if blob then
+				return blob
+			end
+		end
+
+		if ValueType == "ProtectedString" and PropertyName == "Source" and hasSource(instance) then
 			return sourceFor(instance, decompileIgnoreMap[instance])
 		end
 
 		local Category, Optional = property.Category, property.Optional
+		local specialBlocked = Special and not specialAllowed(instance, PropertyName)
 
 		if CanRead ~= false then
 			local GHPKey = (Category == "Enum" or Category == "Class") and Category or ValueType
@@ -4342,7 +5345,7 @@ local function synsaveinstance(...)
 			if Special then
 				if property.Shadows and GHPShadowed then
 					property.CanRead = false
-				elseif gethiddenproperty and ghpDatatypeAllowed(GHPKey) then
+				elseif gethiddenproperty and not specialBlocked and ghpDatatypeAllowed(GHPKey) then
 					local ok, result = pcall(gethiddenproperty, instance, PropertyName)
 					if ok then
 						raw = result
@@ -4367,7 +5370,7 @@ local function synsaveinstance(...)
 				local ok, result = pcall(index, instance, PropertyName)
 				if ok then
 					raw = result
-				elseif not (property.Shadows and GHPShadowed) and gethiddenproperty and ghpDatatypeAllowed(GHPKey) then
+				elseif not (property.Shadows and GHPShadowed) and gethiddenproperty and specialAllowed(instance, PropertyName) and ghpDatatypeAllowed(GHPKey) then
 					ok, result = pcall(gethiddenproperty, instance, PropertyName)
 					ghpDatatypeReport(GHPKey, ok and not filterPropVal(result, property, Category, Optional))
 					if ok then
@@ -4388,12 +5391,12 @@ local function synsaveinstance(...)
 
 		local GHPFFailed, Fallback = property.GHPFFailed, property.Fallback
 		if GHPFFailed and not Fallback then
-			return __BREAK
+			return breakOrTerrain(instance, PropertyName)
 		end
 
 		if not GHPFFailed then
 			local ok, result
-			if gethiddenproperty_fallback then
+			if gethiddenproperty_fallback and not specialBlocked then
 				ok, result = pcall(gethiddenproperty_fallback, instance, PropertyName)
 			end
 			if result == nil and not nilIsValid(Category, Optional) then
@@ -4417,7 +5420,7 @@ local function synsaveinstance(...)
 			end
 		end
 
-		return __BREAK
+		return breakOrTerrain(instance, PropertyName)
 	end
 
 	local function GetInheritedProps(className)
@@ -4434,6 +5437,18 @@ local function synsaveinstance(...)
 		end
 		inheritedProperties[className] = prop_list
 		return prop_list
+	end
+
+	local function buildSourceClasses()
+		table.clear(SourceClasses)
+		for className in ClassList do
+			for _, property in GetInheritedProps(className) do
+				if property.Name == "Source" and property.ValueType == "ProtectedString" then
+					SourceClasses[className] = true
+					break
+				end
+			end
+		end
 	end
 
 	local function getDefaultObject(class)
@@ -4464,12 +5479,17 @@ local function synsaveinstance(...)
 		return TYPE_DEFAULTS[binaryType]
 	end
 
+	local function countSkip(reason)
+		Stats.skipped[reason] = (Stats.skipped[reason] or 0) + 1
+	end
+
 	local function collect(roots)
 		local ctx = {
 			entries = {},
 			classList = {},
 			ordered = {},
 			refs = {},
+			editables = {},
 			instCount = 0,
 			instTypeCount = 0,
 		}
@@ -4510,21 +5530,25 @@ local function synsaveinstance(...)
 
 			if not tagOverride then
 				if IgnoreNotArchivable and not instance.Archivable then
+					countSkip("nao arquivavel")
 					return
 				end
 				skipEntirely = IgnoreList[instance]
 				if skipEntirely then
+					countSkip("IgnoreList")
 					return
 				end
 				local onIgnoredList = IgnoreList[class]
 				if onIgnoredList == false then
 					skipEntirely = false
 				elseif onIgnoredList and (onIgnoredList == true or onIgnoredList[name]) then
+					countSkip("IgnoreList")
 					return
 				end
 				local fix = NotCreatableFixes[class]
 				if fix then
 					if not SaveNotCreatable then
+						countSkip("classe nao criavel")
 						return
 					end
 					class, override = fix, replaceClassName(instance, name, class)
@@ -4557,6 +5581,10 @@ local function synsaveinstance(...)
 				parent = parent,
 			}
 			entries[instance] = e
+
+			if OPTIONS.ExportEditable and not virtual and (e.class == "EditableImage" or e.class == "EditableMesh") then
+				ctx.editables[#ctx.editables + 1] = instance
+			end
 
 			refs[instance] = ctx.instCount
 			ctx.instCount += 1
@@ -4602,11 +5630,12 @@ local function synsaveinstance(...)
 	end
 
 	local pendingExtras = {}
+	local deferredNodes = {}
 
-	local function register_extra(name, instanceOrTable, saveProps, customClassName, source)
+	local function register_extra(name, instanceOrTable, saveProps, customClassName, source, defer)
 		customClassName = customClassName or "Folder"
 		local properties = { Name = name, Source = source }
-		local extra = { customClassName = customClassName, properties = properties }
+		local extra = { customClassName = customClassName, properties = properties, defer = defer }
 		if instanceOrTable and saveProps and type(instanceOrTable) ~= "table" then
 			local existing = InstancesOverrides[instanceOrTable]
 			if existing then
@@ -4634,6 +5663,42 @@ local function synsaveinstance(...)
 		return extra
 	end
 
+	local function makeVirtual(className, name, properties, defer)
+		local node = {}
+		properties.Name = name
+		InstancesOverrides[node] = {
+			__ClassName = className,
+			__Virtual = className,
+			__Children = {},
+			Properties = properties,
+		}
+		if defer then
+			deferredNodes[node] = true
+		end
+		return node
+	end
+
+	local Assets, AssetOrder = {}, {}
+	local ASSET_VALUE_TYPES = { Content = true, ContentId = true }
+
+	local function recordAsset(value, className, propName)
+		local uri = contentToUri(value)
+		if not uri or uri == "" then
+			return
+		end
+		local id = string.match(uri, "rbxassetid://(%d+)") or string.match(uri, "[?&]id=(%d+)")
+		if not id then
+			return
+		end
+		local entry = Assets[id]
+		if entry then
+			entry.uses += 1
+		else
+			Assets[id] = { id = id, uses = 1, example = className .. "." .. propName, status = "nao verificado" }
+			AssetOrder[#AssetOrder + 1] = id
+		end
+	end
+
 	local function readAll(objs, prop, class, binaryType)
 		local n = #objs
 		local vals = table.create(n)
@@ -4653,6 +5718,9 @@ local function synsaveinstance(...)
 			if class == "Terrain" and (prop.Name == "SmoothGrid" or prop.Name == "PhysicsGrid") then
 				logDropped("[terreno] " .. prop.Name .. " ilegivel neste executor: o terreno pode sair VAZIO")
 			end
+			if class == "Terrain" and prop.Name == "SmoothGrid" then
+				noteTerrain(nil)
+			end
 			return nil, n
 		end
 		if missingCount > 0 then
@@ -4661,6 +5729,23 @@ local function synsaveinstance(...)
 				vals[missing[k]] = dv
 			end
 			logDropped(class .. "." .. prop.Name, missingCount)
+		end
+		if class == "Terrain" and prop.Name == "SmoothGrid" then
+			noteTerrain(vals[1])
+		end
+		if class == "MeshPart" and prop.Name == "MeshId" then
+			Stats.meshParts += n
+			for i = 1, n do
+				local uri = contentToUri(vals[i])
+				if not uri or uri == "" then
+					Stats.meshPartsNoMesh += 1
+				end
+			end
+		end
+		if ASSET_VALUE_TYPES[prop.ValueType] then
+			for i = 1, n do
+				recordAsset(vals[i], class, prop.Name)
+			end
 		end
 		return vals
 	end
@@ -4748,7 +5833,7 @@ local function synsaveinstance(...)
 
 			local skipProps = IgnorePropertiesOfNotScriptsOnScriptsMode
 				and not entry.propsOnly
-				and not isLuaSourceContainer(objs[1])
+				and not hasSource(objs[1])
 
 			if entry.propsOnly then
 				for propName in entry.override.Properties do
@@ -4961,7 +6046,7 @@ local function synsaveinstance(...)
 							savebuffer_size += 1
 						end
 					end
-				elseif not (IgnorePropertiesOfNotScriptsOnScriptsMode and not isLuaSourceContainer(instance)) then
+				elseif not (IgnorePropertiesOfNotScriptsOnScriptsMode and not hasSource(instance)) then
 					local default_instance, new_def_inst
 					if IgnoreDefaultProperties then
 						default_instance = defaultInstances[entry.class]
@@ -4987,8 +6072,21 @@ local function synsaveinstance(...)
 						local ValueType = Property.ValueType
 						local Category, Optional = Property.Category, Property.Optional
 						local raw = readProperty(instance, Property)
+						if PropertyName == "SmoothGrid" and entry.class == "Terrain" then
+							noteTerrain(raw ~= __BREAK and raw or nil)
+						end
 						if raw == __BREAK then
 							continue
+						end
+						if ASSET_VALUE_TYPES[ValueType] then
+							recordAsset(raw, entry.class, PropertyName)
+						end
+						if entry.class == "MeshPart" and PropertyName == "MeshId" then
+							Stats.meshParts += 1
+							local uri = contentToUri(raw)
+							if not uri or uri == "" then
+								Stats.meshPartsNoMesh += 1
+							end
 						end
 						if default_instance and Property.CanRead and not Property.Special and ValueType ~= "ProtectedString" then
 							if new_def_inst then
@@ -5190,7 +6288,483 @@ local function synsaveinstance(...)
 
 	local old_gethiddenproperty
 
+	local Accum = { gone = {}, order = {}, count = 0, lastAddedAt = os.clock(), min = nil, max = nil, tracking = false }
+
+	local RemoteLogData, RemoteLogCount = {}, 0
+
+	local function recordRemote(remote, direction, method, ...)
+		if RemoteLogCount >= OPTIONS.RemoteLogLimit then
+			return
+		end
+		local okName, path = pcall(remote.GetFullName, remote)
+		if not okName then
+			return
+		end
+		local entry = RemoteLogData[path]
+		if not entry then
+			entry = { Class = remote.ClassName, Out = {}, In = {} }
+			RemoteLogData[path] = entry
+			Stats.remotes += 1
+		end
+		local count = select("#", ...)
+		local types = table.create(count)
+		for i = 1, count do
+			types[i] = typeof((select(i, ...)))
+		end
+		local signature = table.concat(types, ", ")
+		local bucket = direction == "out" and entry.Out or entry.In
+		local record = bucket[signature]
+		if not record then
+			record = { Signature = signature, Count = 0, Method = method, Sample = "" }
+			local sample = table.pack(...)
+			local okSample, literal = pcall(function()
+				local items = {}
+				for i = 1, math.min(sample.n, 8) do
+					items[i] = luaLiteral(sample[i], 1, nil, { n = 200 })
+				end
+				return table.concat(items, ", ")
+			end)
+			if okSample then
+				record.Sample = literal
+			end
+			bucket[signature] = record
+		end
+		record.Count += 1
+		RemoteLogCount += 1
+	end
+
+	local function completenessLines()
+		local lines = { "RELATORIO DE COMPLETUDE:", "  Instancias gravadas: " .. Stats.instances }
+		local skipped = {}
+		for reason, count in Stats.skipped do
+			skipped[#skipped + 1] = reason .. "=" .. count
+		end
+		table.sort(skipped)
+		if #skipped > 0 then
+			lines[#lines + 1] = "  Ignoradas: " .. table.concat(skipped, ", ")
+		end
+		lines[#lines + 1] = string.format(
+			"  Scripts: %d lidos | %d ok | %d falhas de decompile | %d vazios | %d de servidor (impossiveis) | %d ignorados",
+			Stats.scripts,
+			Stats.scriptsOk,
+			Stats.scriptsFailed,
+			Stats.scriptsEmpty,
+			Stats.scriptsServer,
+			Stats.scriptsSkipped
+		)
+		if Stats.modulesExtracted > 0 or Stats.constantsAppended > 0 then
+			lines[#lines + 1] = string.format(
+				"  Recuperados de scripts com falha: %d modulos via require | %d com constantes do bytecode",
+				Stats.modulesExtracted,
+				Stats.constantsAppended
+			)
+		end
+		lines[#lines + 1] = string.format("  MeshParts: %d | sem MeshId: %d", Stats.meshParts, Stats.meshPartsNoMesh)
+		lines[#lines + 1] = "  Terreno: " .. Stats.terrain
+		if SweepRan then
+			lines[#lines + 1] = "  Varredura de streaming: " .. Stats.sweepPoints .. " pontos visitados"
+		end
+		if Stats.accumulated > 0 then
+			lines[#lines + 1] = "  Instancias recuperadas pela captura acumulativa: " .. Stats.accumulated
+		end
+		if Stats.externalContent > 0 then
+			lines[#lines + 1] = "  Objetos externos de Content incluidos: " .. Stats.externalContent
+		end
+		if Stats.editableImages + Stats.editableMeshes > 0 then
+			lines[#lines + 1] = string.format("  Editaveis exportados: %d imagens | %d malhas", Stats.editableImages, Stats.editableMeshes)
+		end
+		if Stats.gcInstances + Stats.gcTables > 0 then
+			lines[#lines + 1] = string.format("  Varredura de memoria: %d instancias | %d tabelas", Stats.gcInstances, Stats.gcTables)
+		end
+		if Stats.remotes > 0 then
+			lines[#lines + 1] = "  Remotes registrados: " .. Stats.remotes
+		end
+		lines[#lines + 1] = "  Assets referenciados (IDs unicos): " .. #AssetOrder
+		return lines
+	end
+
 	local function save_game()
+		local function accumKey(instance)
+			local ok, key = pcall(function()
+				local k = instance.ClassName .. "|" .. instance.Name
+				if instance:IsA("PVInstance") then
+					local p = instance:GetPivot().Position
+					k ..= string.format("|%.1f,%.1f,%.1f", p.X, p.Y, p.Z)
+				end
+				return k
+			end)
+			return ok and key or tostring(instance)
+		end
+
+		local function applyAccumulated()
+			if not OPTIONS.Accumulate or Accum.count == 0 then
+				return
+			end
+			local eligible = {}
+			for _, instance in Accum.order do
+				local info = Accum.gone[instance]
+				if info and instance.Parent == nil then
+					local destroyed = false
+					if not OPTIONS.AccumulateDestroyed then
+						if not pcall(function()
+							instance.Parent = nil
+						end) then
+							destroyed = true
+						elseif info.kids > 0 and #instance:GetChildren() == 0 then
+							destroyed = true
+						end
+					end
+					if not destroyed then
+						eligible[instance] = info
+					end
+				end
+			end
+			local placed, groups, parentOrder = {}, {}, {}
+			for _ = 1, 3 do
+				local changed = false
+				for _, instance in Accum.order do
+					local info = eligible[instance]
+					if info and not placed[instance] then
+						local parent = info.parent
+						local ok, inTree = pcall(function()
+							return parent == game or parent:IsDescendantOf(game)
+						end)
+						if (ok and inTree) or placed[parent] then
+							placed[instance] = true
+							changed = true
+							local group = groups[parent]
+							if not group then
+								group = {}
+								groups[parent] = group
+								parentOrder[#parentOrder + 1] = parent
+							end
+							group[#group + 1] = instance
+						end
+					end
+				end
+				if not changed then
+					break
+				end
+			end
+			for _, parent in parentOrder do
+				local override = InstancesOverrides[parent]
+				local children
+				if override and override.__Children then
+					children = table.clone(override.__Children)
+				else
+					children = parent:GetChildren()
+				end
+				local keys = {}
+				for _, child in children do
+					keys[accumKey(child)] = true
+				end
+				local added = 0
+				for _, instance in groups[parent] do
+					local key = accumKey(instance)
+					if not keys[key] then
+						keys[key] = true
+						children[#children + 1] = instance
+						added += 1
+					end
+				end
+				if added > 0 then
+					if override then
+						override.__Children = children
+					else
+						InstancesOverrides[parent] = { __Children = children }
+					end
+					Stats.accumulated += added
+				end
+			end
+		end
+
+		local function remoteLogSource()
+			if next(RemoteLogData) == nil then
+				return "return {}"
+			end
+			local paths = {}
+			for path in RemoteLogData do
+				paths[#paths + 1] = path
+			end
+			table.sort(paths)
+			local lines = { "-- Remotes observados durante a sessao (interface cliente <-> servidor)", "return {" }
+			for _, path in paths do
+				local entry = RemoteLogData[path]
+				lines[#lines + 1] = "\t[" .. string.format("%q", path) .. "] = {"
+				lines[#lines + 1] = "\t\tClass = " .. string.format("%q", entry.Class) .. ","
+				for _, direction in { "Out", "In" } do
+					local records = {}
+					for _, record in entry[direction] do
+						records[#records + 1] = record
+					end
+					table.sort(records, function(a, b)
+						return a.Signature < b.Signature
+					end)
+					if #records > 0 then
+						lines[#lines + 1] = "\t\t" .. direction .. " = {"
+						for _, record in records do
+							lines[#lines + 1] = string.format(
+								"\t\t\t{ Call = %q, Signature = %q, Count = %d, Sample = %q },",
+								record.Method .. "(" .. record.Signature .. ")",
+								record.Signature,
+								record.Count,
+								record.Sample
+							)
+						end
+						lines[#lines + 1] = "\t\t},"
+					end
+				end
+				lines[#lines + 1] = "\t},"
+			end
+			lines[#lines + 1] = "}"
+			return table.concat(lines, "\n")
+		end
+
+		local EditableFiles = {}
+
+		local function exportEditables(ctx)
+			if #ctx.editables == 0 or not writefile then
+				return
+			end
+			pcall(makefolder, ASSET_FOLDER)
+			table.clear(EditableFiles)
+			Stats.editableImages, Stats.editableMeshes = 0, 0
+			for counter, instance in ctx.editables do
+				pulse()
+				local okName, fullName = pcall(instance.GetFullName, instance)
+				fullName = okName and fullName or instance.Name
+				local isImage = instance.ClassName == "EditableImage"
+				local path = ASSET_FOLDER .. sanitizeFileName(instance.Name) .. "_" .. counter .. (isImage and ".png" or ".obj")
+				local ok, err = pcall(function()
+					if isImage then
+						local size = instance.Size
+						local width, height = math.floor(size.X), math.floor(size.Y)
+						if width < 1 or height < 1 or width * height > OPTIONS.EditableMaxPixels then
+							error("tamanho fora do limite")
+						end
+						writefile(path, encodePNG(width, height, instance:ReadPixelsBuffer(Vector2.zero, size)))
+					else
+						writefile(path, meshToObj(instance))
+					end
+				end)
+				if ok then
+					EditableFiles[#EditableFiles + 1] = path .. " <- " .. fullName
+					if isImage then
+						Stats.editableImages += 1
+					else
+						Stats.editableMeshes += 1
+					end
+				else
+					logDropped("[" .. instance.ClassName .. " nao exportado] " .. tostring(err))
+				end
+			end
+		end
+
+		local function processAssets()
+			if #AssetOrder == 0 or not writefile then
+				return
+			end
+			pcall(makefolder, ASSET_FOLDER)
+			if OPTIONS.DownloadAssets then
+				local fetch = makeTimeoutHandler(15, function(id)
+					return game:HttpGet("https://assetdelivery.roblox.com/v1/asset/?id=" .. id)
+				end, "timeout")
+				local limit = math.min(#AssetOrder, OPTIONS.AssetDownloadLimit)
+				setPhase("Baixando assets", limit)
+				for i = 1, limit do
+					local entry = Assets[AssetOrder[i]]
+					local ok, data = fetch(entry.id)
+					if ok and type(data) == "string" and #data > 0 and #data <= OPTIONS.AssetMaxBytes and string.sub(data, 1, 10) ~= '{"errors":' then
+						local okWrite = pcall(writefile, ASSET_FOLDER .. entry.id .. ".bin", data)
+						entry.status = okWrite and ("baixado (" .. #data .. " bytes)") or "falha ao gravar"
+						Stats.assetsDownloaded += okWrite and 1 or 0
+					else
+						entry.status = "privado ou indisponivel"
+						Stats.assetsFailed += 1
+					end
+					processed += 1
+					pulse()
+				end
+			end
+			if OPTIONS.AssetListFile then
+				local lines = { "id\tusos\tstatus\texemplo" }
+				for _, id in AssetOrder do
+					local entry = Assets[id]
+					lines[#lines + 1] = entry.id .. "\t" .. entry.uses .. "\t" .. entry.status .. "\t" .. entry.example
+				end
+				pcall(writefile, ASSET_FOLDER .. sanitizeFileName(placename) .. "_assets.txt", table.concat(lines, "\n"))
+			end
+		end
+
+		local function resetBuildStats()
+			Stats.scripts, Stats.scriptsOk, Stats.scriptsFailed, Stats.scriptsEmpty = 0, 0, 0, 0
+			Stats.scriptsServer, Stats.scriptsSkipped, Stats.modulesExtracted, Stats.constantsAppended = 0, 0, 0, 0
+			Stats.meshParts, Stats.meshPartsNoMesh = 0, 0
+			Stats.terrain, Stats.terrainSource = "nao lido", false
+			table.clear(Stats.skipped)
+			table.clear(Assets)
+			table.clear(AssetOrder)
+		end
+
+		local GC_INSTANCE_CLASSES = {
+			"PVInstance", "LayerCollector", "GuiObject", "Folder", "Configuration", "ValueBase",
+			"LuaSourceContainer", "BackpackItem", "Accoutrement", "Sound", "Animation",
+		}
+
+		local function gcInstanceAllowed(instance)
+			for _, className in GC_INSTANCE_CLASSES do
+				if instance:IsA(className) then
+					return true
+				end
+			end
+			return false
+		end
+
+		local nilSeen = {}
+
+		local function fixNilInstance(instance)
+			if nilSeen[instance] then
+				return nil
+			end
+			nilSeen[instance] = true
+			if instance:IsA("ServiceProvider") then
+				return nil
+			end
+			local ClassName = instance.ClassName
+			local NilInstancesFixes = OPTIONS.NilInstancesFixes
+			local Fix = NilInstancesFixes[ClassName]
+			if Fix == nil then
+				for class_name, inheritedFix in NilInstancesFixes do
+					if instance:IsA(class_name) then
+						Fix = inheritedFix
+						break
+					end
+				end
+			end
+			if Fix then
+				instance = Fix(instance, InstancesOverrides)
+			end
+			local Class = ClassList[ClassName]
+			if Class and Class.Service then
+				instance = nil
+			end
+			return instance
+		end
+
+		local function scanGC(dataChildren)
+			if not (OPTIONS.ScanGC and getgc) then
+				return
+			end
+			local okGC, objects = pcall(getgc, true)
+			if not okGC or type(objects) ~= "table" then
+				return
+			end
+			local instances, candidates = {}, {}
+			for _, value in objects do
+				local t = typeof(value)
+				if t == "Instance" then
+					pcall(function()
+						if value.Parent == nil and gcInstanceAllowed(value) then
+							local fixed = fixNilInstance(value)
+							if fixed then
+								instances[#instances + 1] = fixed
+							end
+						end
+					end)
+				elseif t == "table" then
+					pcall(function()
+						local count, primitives, strings = 0, 0, 0
+						for key, item in next, value do
+							count += 1
+							if count > 400 then
+								return
+							end
+							local ti = type(item)
+							if ti == "function" then
+								return
+							end
+							if type(key) == "string" then
+								strings += 1
+							end
+							if ti == "number" or ti == "string" or ti == "boolean" then
+								primitives += 1
+							end
+						end
+						if strings >= 3 and primitives >= 3 then
+							candidates[#candidates + 1] = { value = value, score = primitives }
+						end
+					end)
+				end
+			end
+			if #instances > 0 then
+				Stats.gcInstances = #instances
+				register_extra("GC Instances", instances)
+			end
+			table.sort(candidates, function(a, b)
+				return a.score > b.score
+			end)
+			local modules, seenSources = {}, {}
+			for _, candidate in candidates do
+				if #modules >= OPTIONS.GCTableLimit then
+					break
+				end
+				local okLiteral, literal = pcall(luaLiteral, candidate.value)
+				if okLiteral and not seenSources[literal] then
+					seenSources[literal] = true
+					modules[#modules + 1] = makeVirtual("ModuleScript", string.format("Table_%03d", #modules + 1), { Source = "return " .. literal }, true)
+				end
+			end
+			if #modules > 0 then
+				Stats.gcTables = #modules
+				local folder = makeVirtual("Folder", "GC Tables", {}, true)
+				InstancesOverrides[folder].__Children = modules
+				dataChildren[#dataChildren + 1] = folder
+			end
+		end
+
+		local function terrainSlotsSource()
+			local terrain = workspace:FindFirstChildOfClass("Terrain")
+			if not terrain then
+				return nil
+			end
+			local data = {}
+			for _, material in Enum.Material:GetEnumItems() do
+				local entry = {}
+				local okColor, color = pcall(terrain.GetMaterialColor, terrain, material)
+				if okColor and typeof(color) == "Color3" then
+					entry.Color = color
+				end
+				local okSlot, slot = pcall(function()
+					return terrain:GetMaterialSlot(material)
+				end)
+				if okSlot and slot ~= nil then
+					entry.Slot = typeof(slot) == "Instance" and slot.Name or slot
+				end
+				if next(entry) then
+					data[material.Name] = entry
+				end
+			end
+			if not next(data) then
+				return nil
+			end
+			return "return " .. luaLiteral(data)
+		end
+
+		local function hasEditables()
+			for _, root in ToSaveList do
+				if typeof(root) == "Instance" then
+					local ok, found = pcall(function()
+						return root:FindFirstChildWhichIsA("EditableImage", true) or root:FindFirstChildWhichIsA("EditableMesh", true)
+					end)
+					if ok and found then
+						return true
+					end
+				end
+			end
+			return false
+		end
+
+
 		SaveNotCreatable = SaveNotCreatable
 			or IsolateLocalPlayer
 			or IsolatePlayers
@@ -5221,37 +6795,43 @@ local function synsaveinstance(...)
 			register_extra("Players", service.Players)
 		end
 
+		applyAccumulated()
+
 		if NilInstances and global_container.getnilinstances then
-			local nil_instances, nil_instances_size = {}, 1
-			local NilInstancesFixes = OPTIONS.NilInstancesFixes
+			local nil_instances = {}
 			for _, instance in global_container.getnilinstances() do
-				if instance:IsA("ServiceProvider") then
-					instance = nil
-				else
-					local ClassName = instance.ClassName
-					local Fix = NilInstancesFixes[ClassName]
-					if Fix == nil then
-						for class_name, inheritedFix in NilInstancesFixes do
-							if instance:IsA(class_name) then
-								Fix = inheritedFix
-								break
-							end
-						end
-					end
-					if Fix then
-						instance = Fix(instance, InstancesOverrides)
-					end
-					local Class = ClassList[ClassName]
-					if Class and Class.Service then
-						instance = nil
-					end
-				end
-				if instance then
-					nil_instances[nil_instances_size] = instance
-					nil_instances_size += 1
+				local fixed = fixNilInstance(instance)
+				if fixed then
+					nil_instances[#nil_instances + 1] = fixed
 				end
 			end
 			register_extra("Nil Instances", nil_instances)
+		end
+
+		local dataChildren = {}
+		scanGC(dataChildren)
+
+		if OPTIONS.TerrainSlots then
+			local slotsSource = terrainSlotsSource()
+			if slotsSource then
+				dataChildren[#dataChildren + 1] = makeVirtual("ModuleScript", "TerrainMaterialSlots", { Source = slotsSource }, true)
+			end
+		end
+
+		if OPTIONS.RemoteLog and next(RemoteLogData) ~= nil then
+			dataChildren[#dataChildren + 1] = makeVirtual("ModuleScript", "Remotes", { Source = remoteLogSource }, true)
+		end
+
+		if OPTIONS.ExportEditable and hasEditables() then
+			dataChildren[#dataChildren + 1] = makeVirtual("ModuleScript", "EditableExports", {
+				Source = function()
+					return "return " .. luaLiteral(EditableFiles)
+				end,
+			}, true)
+		end
+
+		if #dataChildren > 0 then
+			register_extra("USSI Data", dataChildren, nil, nil, nil, true)
 		end
 
 		local ELAPSED_PLACEHOLDER = "@@ELAPSED" .. string.gsub(service.HttpService:GenerateGUID(false), "-", "") .. "@@"
@@ -5271,9 +6851,8 @@ local function synsaveinstance(...)
 			end
 		end
 
-		local readmeExtra
 		if OPTIONS.ReadMe then
-			readmeExtra = register_extra("README", nil, nil, "Script", function()
+			register_extra("README", nil, nil, "Script", function()
 				local lines = {
 					CREDITS,
 					"",
@@ -5324,6 +6903,12 @@ local function synsaveinstance(...)
 					table.insert(lines, "Decompilacoes/leituras canceladas por timeout: " .. TimedOutThreads)
 					table.insert(lines, "")
 				end
+				if OPTIONS.CompletenessReport then
+					for _, line in completenessLines() do
+						table.insert(lines, line)
+					end
+					table.insert(lines, "")
+				end
 				table.insert(lines, "ServerStorage, ServerScriptService e Scripts de servidor sao IMPOSSIVEIS de salvar por causa do FilteringEnabled.")
 				table.insert(lines, "")
 				table.insert(lines, "Se Unions/MeshParts perderem colisao, rode na Command Bar do Studio:")
@@ -5341,14 +6926,17 @@ local function synsaveinstance(...)
 				table.insert(lines, "Cliente: " .. FULL_VERSION .. " | PlaceId: " .. tostring(game.PlaceId) .. " | PlaceVersion: " .. tostring(game.PlaceVersion))
 				local body = string.gsub(table.concat(lines, "\n\t\t"), "%]%]", "] ]")
 				return "--[[\n\t\t" .. body .. "\n]]"
-			end)
+			end, true)
 		end
 
-		local allRoots = table.clone(ToSaveList)
-		for _, extra in pendingExtras do
-			for _, root in extra.roots do
-				allRoots[#allRoots + 1] = root
+		local function gatherRoots()
+			local allRoots = table.clone(ToSaveList)
+			for _, extra in pendingExtras do
+				for _, root in extra.roots do
+					allRoots[#allRoots + 1] = root
+				end
 			end
+			return allRoots
 		end
 
 		local estimate = 0
@@ -5362,9 +6950,10 @@ local function synsaveinstance(...)
 			totalsize = 0
 			table.clear(DroppedLog)
 			resetSharedStrings()
+			resetBuildStats()
 			setPhase("Coletando", estimate)
 
-			local ctx = collect(allRoots)
+			local ctx = collect(gatherRoots())
 
 			for _, extra in pendingExtras do
 				local src = extra.roots
@@ -5375,12 +6964,17 @@ local function synsaveinstance(...)
 					end
 				end
 				extra.collectedRoots = kept
+				if extra.defer then
+					for _, root in kept do
+						ctx.entries[root].deferLast = true
+					end
+				end
 			end
 
-			if readmeExtra then
-				local readmeEntry = ctx.entries[readmeExtra.roots[1]]
-				if readmeEntry then
-					readmeEntry.deferLast = true
+			for node in deferredNodes do
+				local nodeEntry = ctx.entries[node]
+				if nodeEntry then
+					nodeEntry.deferLast = true
 				end
 			end
 
@@ -5418,12 +7012,37 @@ local function synsaveinstance(...)
 			end
 			ctx.mainRoots = mainRoots
 
+			Stats.instances = ctx.instCount
+			exportEditables(ctx)
+
 			setPhase(OPTIONS.Binary and "Codificando" or "Salvando", ctx.instCount)
 
 			local chunks = OPTIONS.Binary and emitBinary(ctx) or emitXML(ctx)
 
 			if OPTIONS.ReadMe then
 				stampElapsed(chunks, os.clock() - elapse_t)
+			end
+			return chunks, ctx
+		end
+
+		local externalPassDone = false
+		local function buildWithExternals()
+			local chunks, ctx = buildOutput()
+			if OPTIONS.ExternalContentPass and OPTIONS.Binary and not externalPassDone and next(ExternalContentPending) then
+				externalPassDone = true
+				local list = {}
+				for object in ExternalContentPending do
+					if typeof(object) == "Instance" then
+						list[#list + 1] = object
+					end
+				end
+				table.clear(ExternalContentPending)
+				if #list > 0 then
+					register_extra("External Content", list)
+					local rebuilt, rebuiltCtx = buildOutput()
+					Stats.externalContent = #list
+					return rebuilt, rebuiltCtx
+				end
 			end
 			return chunks, ctx
 		end
@@ -5463,7 +7082,7 @@ local function synsaveinstance(...)
 			if idx > 1 then
 				warn("[USSI] Retry " .. (idx - 1) .. ": " .. attempt.label)
 			end
-			local ok, chunks, ctx = xpcall(buildOutput, function(e)
+			local ok, chunks, ctx = xpcall(buildWithExternals, function(e)
 				return debug.traceback(tostring(e))
 			end)
 			local problem
@@ -5495,6 +7114,8 @@ local function synsaveinstance(...)
 		elseif OPTIONS.Validate then
 			validationNote = " | Validado" .. (#AttemptLog > 1 and (" (tentativa " .. #AttemptLog .. ")") or "")
 		end
+
+		processAssets()
 
 		phase = "Escrevendo"
 
@@ -5609,10 +7230,13 @@ local function synsaveinstance(...)
 		table.insert(Connections, event:Connect(func))
 	end
 
+	local remoteLogActive = false
+
 	local function Cleanup()
 		for _, connection in Connections do
 			connection:Disconnect()
 		end
+		remoteLogActive = false
 		if LoadingThread then
 			task.cancel(LoadingThread)
 			LoadingThread = nil
@@ -5625,6 +7249,8 @@ local function synsaveinstance(...)
 			end
 		end
 		table.clear(defaultObjects)
+		table.clear(Accum.gone)
+		table.clear(Accum.order)
 		stopWatermark()
 		GLOBAL_ENV[guardKey] = nil
 	end
@@ -5670,54 +7296,108 @@ local function synsaveinstance(...)
 		end
 	end
 
-	if OPTIONS.SafeMode and CustomOptions_valid["KillAllScripts"] == nil then
-		OPTIONS.KillAllScripts = true
+	local ACCUM_CLASSES = {
+		"PVInstance", "LayerCollector", "GuiObject", "Folder", "Configuration", "ValueBase",
+		"LuaSourceContainer", "BackpackItem", "Accoutrement", "Sound",
+	}
+
+	local function accumulatable(instance)
+		for _, className in ACCUM_CLASSES do
+			if instance:IsA(className) then
+				return true
+			end
+		end
+		return false
 	end
 
-	if OPTIONS.KillAllScripts and not GLOBAL_ENV.USSI_KAS then
-		GLOBAL_ENV.USSI_KAS = true
-		game:GetService("ScriptContext"):SetTimeout(math.clamp(SaveCacheInterval * 0.000047, 20, 30))
-		local self = coroutine.running()
-		do
-			local islclosure = islclosure
-			local isexecutorclosure = isexecutorclosure or checkclosure or isourclosure
-			local hookfunction = not IS_VOLT_EXECUTOR and hookfunction
-			local done = {}
-			local function filterNkill(f)
-				if not f then
-					return
-				end
-				for _, v in table.clone(f()) do
-					if not done[v] then
-						done[v] = true
-						local _type = type(v)
-						if _type == "thread" then
-							if v ~= self then
-								pcall(coroutine.close, v)
-							end
-						elseif _type == "function" then
-							if (not islclosure or islclosure(v)) and (not isexecutorclosure or not isexecutorclosure(v)) then
-								if hookfunction then
-									pcall(hookfunction, v, coroutine.yield)
-								end
-							end
-						end
-					end
-				end
+	local function trackBounds(instance)
+		local ok, position = pcall(function()
+			if instance:IsA("BasePart") then
+				return instance.Position
 			end
-			filterNkill(debug and debug.getregistry or getreg or getregistry)
-			filterNkill(getallthreads)
-			filterNkill(getgc)
+			return nil
+		end)
+		if ok and position then
+			Accum.min = Accum.min and Accum.min:Min(position) or position
+			Accum.max = Accum.max and Accum.max:Max(position) or position
 		end
 	end
 
-	if IsolateStarterPlayer then
-		IgnoreList.StarterPlayer = false
+	local function startAccumulation()
+		for _, root in ToSaveList do
+			if typeof(root) == "Instance" and root ~= game then
+				Connect(root.DescendantAdded, function(instance)
+					Accum.lastAddedAt = os.clock()
+					if Accum.tracking then
+						trackBounds(instance)
+					end
+				end)
+				if OPTIONS.Accumulate then
+					Connect(root.DescendantRemoving, function(instance)
+						if Accum.count >= OPTIONS.AccumulateLimit or Accum.gone[instance] then
+							return
+						end
+						local parent = instance.Parent
+						if not parent or not accumulatable(instance) then
+							return
+						end
+						local okKids, kids = pcall(instance.GetChildren, instance)
+						Accum.gone[instance] = { parent = parent, kids = okKids and #kids or 0 }
+						Accum.count += 1
+						Accum.order[Accum.count] = instance
+					end)
+				end
+			end
+		end
 	end
 
-	if not IsolatePlayers and CustomOptions_valid.SaveNotCreatable == nil then
-		IgnoreList.Player = true
+	local function startRemoteLog()
+		if not OPTIONS.RemoteLog then
+			return
+		end
+		if not (hookmetamethod and getnamecallmethod) then
+			warn("[USSI] RemoteLog indisponivel: hookmetamethod/getnamecallmethod ausentes")
+			return
+		end
+		remoteLogActive = true
+		local oldNamecall
+		oldNamecall = hookmetamethod(game, "__namecall", (newcclosure or function(f)
+			return f
+		end)(function(self, ...)
+			local method = getnamecallmethod()
+			if remoteLogActive and (method == "FireServer" or method == "InvokeServer") and typeof(self) == "Instance" and not (checkcaller and checkcaller()) then
+				pcall(recordRemote, self, "out", method, ...)
+			end
+			if setnamecallmethod then
+				setnamecallmethod(method)
+			end
+			return oldNamecall(self, ...)
+		end))
+		local function listen(remote)
+			Connect(remote.OnClientEvent, function(...)
+				if remoteLogActive then
+					recordRemote(remote, "in", "OnClientEvent", ...)
+				end
+			end)
+		end
+		for _, root in ToSaveList do
+			if typeof(root) == "Instance" and root ~= game then
+				for _, descendant in root:GetDescendants() do
+					if descendant:IsA("RemoteEvent") then
+						listen(descendant)
+					end
+				end
+				Connect(root.DescendantAdded, function(descendant)
+					if descendant:IsA("RemoteEvent") then
+						listen(descendant)
+					end
+				end)
+			end
+		end
 	end
+
+	startAccumulation()
+	startRemoteLog()
 
 	if OPTIONS.ShowStatus then
 		do
@@ -5785,6 +7465,172 @@ local function synsaveinstance(...)
 		end
 	end
 
+	local function streamingSweep()
+		local okStreaming, streaming = pcall(function()
+			return workspace.StreamingEnabled
+		end)
+		if not (OPTIONS.StreamingSweep and okStreaming and streaming) then
+			return
+		end
+		local player = GetLocalPlayer()
+		local deadline = os.clock() + 8
+		while os.clock() < deadline and not (player.Character and player.Character:FindFirstChild("HumanoidRootPart")) do
+			task.wait(0.1)
+		end
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local camera = workspace.CurrentCamera
+		if not root or not camera then
+			warn("[USSI] Varredura de streaming ignorada: personagem ou camera indisponivel")
+			return
+		end
+		local originCFrame, originGravity = root.CFrame, workspace.Gravity
+		local originCameraType, originCameraCFrame = camera.CameraType, camera.CFrame
+		SweepOrigin = originCFrame.Position
+		local terrain = workspace:FindFirstChildOfClass("Terrain")
+
+		local function cacheTerrainAround(position)
+			local radius = OPTIONS.TerrainReadRadius
+			for cx = math.floor((position.X - radius) / 128), math.floor((position.X + radius) / 128) do
+				for cy = math.floor((position.Y - 256) / 128), math.floor((position.Y + 256) / 128) do
+					for cz = math.floor((position.Z - radius) / 128), math.floor((position.Z + radius) / 128) do
+						readTerrainChunk(terrain, cx, cy, cz)
+					end
+				end
+			end
+		end
+
+		local function visit(position)
+			root.CFrame = CFrame.new(position)
+			root.AssemblyLinearVelocity = Vector3.zero
+			camera.CFrame = CFrame.new(position + Vector3.new(0, 50, 0), position)
+			local limit = os.clock() + OPTIONS.SweepWait * 5
+			task.wait(0.1)
+			while os.clock() < limit and os.clock() - Accum.lastAddedAt < OPTIONS.SweepWait do
+				task.wait(0.05)
+			end
+			if terrain and OPTIONS.TerrainFallback then
+				cacheTerrainAround(position)
+			end
+		end
+
+		local function currentBounds()
+			local bounds = OPTIONS.SweepBounds
+			local minV, maxV
+			if type(bounds) == "table" and bounds.Min and bounds.Max then
+				minV, maxV = bounds.Min, bounds.Max
+			else
+				minV = Accum.min or originCFrame.Position
+				maxV = Accum.max or originCFrame.Position
+			end
+			local limit = OPTIONS.SweepMaxExtent
+			return Vector3.new(math.clamp(minV.X, -limit, limit), math.clamp(minV.Y, -limit, limit), math.clamp(minV.Z, -limit, limit)),
+				Vector3.new(math.clamp(maxV.X, -limit, limit), math.clamp(maxV.Y, -limit, limit), math.clamp(maxV.Z, -limit, limit))
+		end
+
+		local ok, err = pcall(function()
+			workspace.Gravity = 0
+			camera.CameraType = Enum.CameraType.Scriptable
+			Accum.tracking = true
+			Accum.min, Accum.max = nil, nil
+			for _, instance in workspace:GetDescendants() do
+				trackBounds(instance)
+			end
+			local radius = 256
+			pcall(function()
+				radius = workspace.StreamingTargetRadius
+			end)
+			local step = OPTIONS.SweepStep or math.clamp(radius * 1.2, 96, 1024)
+			local visited, count = {}, 0
+			local progressed = true
+			while progressed and count < OPTIONS.SweepMaxPoints do
+				progressed = false
+				local minV, maxV = currentBounds()
+				for ix = math.floor(minV.X / step), math.ceil(maxV.X / step) do
+					for iy = math.floor(minV.Y / step), math.ceil(maxV.Y / step) do
+						for iz = math.floor(minV.Z / step), math.ceil(maxV.Z / step) do
+							local key = ix .. ":" .. iy .. ":" .. iz
+							if count < OPTIONS.SweepMaxPoints and not visited[key] then
+								visited[key] = true
+								count += 1
+								progressed = true
+								if StatusText then
+									StatusText.Text = "Varredura de streaming: ponto " .. count
+								end
+								visit(Vector3.new(ix * step, iy * step, iz * step))
+							end
+						end
+					end
+				end
+			end
+			Stats.sweepPoints = count
+		end)
+
+		pcall(function()
+			root.CFrame = originCFrame
+			root.AssemblyLinearVelocity = Vector3.zero
+			workspace.Gravity = originGravity
+			camera.CameraType = originCameraType
+			camera.CFrame = originCameraCFrame
+		end)
+		Accum.tracking = false
+		SweepRan = Stats.sweepPoints > 0
+		if not ok then
+			warn("[USSI] Varredura de streaming interrompida:", err)
+		end
+	end
+
+	streamingSweep()
+
+	if OPTIONS.SafeMode and CustomOptions_valid["KillAllScripts"] == nil then
+		OPTIONS.KillAllScripts = true
+	end
+
+	if OPTIONS.KillAllScripts and not GLOBAL_ENV.USSI_KAS then
+		GLOBAL_ENV.USSI_KAS = true
+		game:GetService("ScriptContext"):SetTimeout(math.clamp(SaveCacheInterval * 0.000047, 20, 30))
+		local self = coroutine.running()
+		do
+			local islclosure = islclosure
+			local isexecutorclosure = isexecutorclosure or checkclosure or isourclosure
+			local hookfunction = not IS_VOLT_EXECUTOR and hookfunction
+			local done = {}
+			local function filterNkill(f)
+				if not f then
+					return
+				end
+				for _, v in table.clone(f()) do
+					if not done[v] then
+						done[v] = true
+						local _type = type(v)
+						if _type == "thread" then
+							if v ~= self then
+								pcall(coroutine.close, v)
+							end
+						elseif _type == "function" then
+							if (not islclosure or islclosure(v)) and (not isexecutorclosure or not isexecutorclosure(v)) then
+								if hookfunction then
+									pcall(hookfunction, v, coroutine.yield)
+								end
+							end
+						end
+					end
+				end
+			end
+			filterNkill(debug and debug.getregistry or getreg or getregistry)
+			filterNkill(getallthreads)
+			filterNkill(getgc)
+		end
+	end
+
+	if IsolateStarterPlayer then
+		IgnoreList.StarterPlayer = false
+	end
+
+	if not IsolatePlayers and CustomOptions_valid.SaveNotCreatable == nil then
+		IgnoreList.Player = true
+	end
+
 	local kickSnapshot = GLOBAL_ENV.USSI_kicksnapshot
 	if not kickSnapshot then
 		kickSnapshot = {}
@@ -5817,6 +7663,9 @@ local function synsaveinstance(...)
 		task.spawn(function()
 			local LocalPlayer = GetLocalPlayer()
 			snapshotKick(LocalPlayer)
+			if OPTIONS.SafeModeDelay > 0 then
+				task.wait(OPTIONS.SafeModeDelay)
+			end
 			local msg = "[SAVEINSTANCE SAFEMODE]\nSalvando..\nNao saia do jogo\nPatched by Trufas\nPara desativar: SafeMode=false"
 			local function Kick()
 				LocalPlayer:Kick(msg)
@@ -6165,6 +8014,8 @@ local function synsaveinstance(...)
 		end
 	end
 
+	buildSourceClasses()
+
 	if OPTIONS.IgnoreSpecialProperties and gethiddenproperty then
 		old_gethiddenproperty = gethiddenproperty
 		gethiddenproperty = nil
@@ -6201,6 +8052,15 @@ local function synsaveinstance(...)
 
 	flushDiskCache()
 	saveGHPState()
+
+	if ok and OPTIONS.CompletenessReport then
+		warn(table.concat(completenessLines(), "\n"))
+	end
+
+	if ok and OPTIONS.Resume and delfile and isfile and isfile(CHECKPOINT_FILE) then
+		pcall(delfile, CHECKPOINT_FILE)
+	end
+
 	Cleanup()
 
 	elapse_t = os.clock() - elapse_t
