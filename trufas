@@ -3678,6 +3678,9 @@ local function synsaveinstance(...)
 		externalContent = 0,
 		assetsDownloaded = 0,
 		assetsFailed = 0,
+		sweepResumed = 0,
+		remoteLogLoaded = 0,
+		contentPasses = 0,
 	}
 
 	local OPTIONS = {
@@ -4454,6 +4457,10 @@ local function synsaveinstance(...)
 		if not (OPTIONS.Resume and writefile) then
 			return
 		end
+		local sweepState
+		if GLOBAL_ENV.USSI_sweepState then
+			sweepState = GLOBAL_ENV.USSI_sweepState
+		end
 		pcall(
 			writefile,
 			CHECKPOINT_FILE,
@@ -4465,6 +4472,7 @@ local function synsaveinstance(...)
 				total = totalWork,
 				scripts = Stats.scripts,
 				time = os.time(),
+				sweep = sweepState,
 			})
 		)
 	end
@@ -4641,8 +4649,12 @@ local function synsaveinstance(...)
 				local now = os.time()
 				for hash, entry in current do
 					if type(entry) == "table" and type(entry.o) == "string" and now - (entry.u or 0) <= DISK_CACHE_TTL then
-						diskCache[hash] = entry
-						diskCacheSize += #entry.o
+						if entry.v == nil or entry.v == FULL_VERSION then
+							diskCache[hash] = entry
+							diskCacheSize += #entry.o
+						else
+							diskCacheDirty = true
+						end
 					else
 						diskCacheDirty = true
 					end
@@ -4739,7 +4751,7 @@ local function synsaveinstance(...)
 				ldeccache[bytecode] = output
 			end
 			if ok and hash then
-				diskCache[hash] = { o = output, u = os.time() }
+				diskCache[hash] = { o = output, u = os.time(), v = FULL_VERSION, b = bytecode }
 				diskCacheSize += #output
 				diskCacheDirty = true
 				if diskCacheSize > DISK_CACHE_LIMIT * 1.25 then
@@ -6291,6 +6303,26 @@ local function synsaveinstance(...)
 	local Accum = { gone = {}, order = {}, count = 0, lastAddedAt = os.clock(), min = nil, max = nil, tracking = false }
 
 	local RemoteLogData, RemoteLogCount = {}, 0
+	do
+		if isfile and readfile and isfile(REMOTE_LOG_FILE) then
+			local ok, data = pcall(function()
+				return service.HttpService:JSONDecode(readfile(REMOTE_LOG_FILE))
+			end)
+			if ok and type(data) == "table" then
+				RemoteLogData = data
+				for _, entry in RemoteLogData do
+					for _, bucket in { entry.Out, entry.In } do
+						if type(bucket) == "table" then
+							for _, record in bucket do
+								RemoteLogCount += record.Count or 0
+							end
+						end
+					end
+				end
+				Stats.remoteLogLoaded = RemoteLogCount
+			end
+		end
+	end
 
 	local function recordRemote(remote, direction, method, ...)
 		if RemoteLogCount >= OPTIONS.RemoteLogLimit then
@@ -6573,10 +6605,26 @@ local function synsaveinstance(...)
 				setPhase("Baixando assets", limit)
 				for i = 1, limit do
 					local entry = Assets[AssetOrder[i]]
-					local ok, data = fetch(entry.id)
+					local cachePath = ASSET_FOLDER .. "cache_" .. entry.id .. ".bin"
+					local data, fromCache
+					if isfile and isfile(cachePath) then
+						local okRead, cached = pcall(readfile, cachePath)
+						if okRead and type(cached) == "string" and #cached > 0 then
+							data, fromCache = cached, true
+						end
+					end
+					local ok = fromCache
+					if not fromCache then
+						ok, data = fetch(entry.id)
+						if ok and type(data) == "string" and #data > 0 and #data <= OPTIONS.AssetMaxBytes and string.sub(data, 1, 10) ~= '{"errors":' then
+							pcall(writefile, cachePath, data)
+						else
+							ok = false
+						end
+					end
 					if ok and type(data) == "string" and #data > 0 and #data <= OPTIONS.AssetMaxBytes and string.sub(data, 1, 10) ~= '{"errors":' then
 						local okWrite = pcall(writefile, ASSET_FOLDER .. entry.id .. ".bin", data)
-						entry.status = okWrite and ("baixado (" .. #data .. " bytes)") or "falha ao gravar"
+						entry.status = okWrite and ((fromCache and "cache hit (" or "baixado (") .. #data .. " bytes)") or "falha ao gravar"
 						Stats.assetsDownloaded += okWrite and 1 or 0
 					else
 						entry.status = "privado ou indisponivel"
@@ -6673,28 +6721,48 @@ local function synsaveinstance(...)
 					end)
 				elseif t == "table" then
 					pcall(function()
-						local count, primitives, strings = 0, 0, 0
+						local count, strings, numbers, bools, nested, funcs = 0, 0, 0, 0, 0, 0
 						for key, item in next, value do
 							count += 1
-							if count > 400 then
+							if count > 800 then
 								return
 							end
-							local ti = type(item)
-							if ti == "function" then
-								return
-							end
-							if type(key) == "string" then
-								strings += 1
-							end
-							if ti == "number" or ti == "string" or ti == "boolean" then
-								primitives += 1
-							end
+							local tk, ti = type(key), type(item)
+							if tk == "string" then strings += 1 end
+							if ti == "string" then strings += 1 end
+							if ti == "number" then numbers += 1 end
+							if ti == "boolean" then bools += 1 end
+							if ti == "table" then nested += 1 end
+							if ti == "function" then funcs += 1 end
 						end
-						if strings >= 3 and primitives >= 3 then
-							candidates[#candidates + 1] = { value = value, score = primitives }
+						if funcs > count * 0.3 then
+							return
+						end
+						local score = strings + numbers + bools + nested * 2
+						if score >= 6 then
+							candidates[#candidates + 1] = { value = value, score = score }
 						end
 					end)
 				end
+			end
+			local extraNil = {}
+			for _, value in objects do
+				if typeof(value) == "Instance" then
+					pcall(function()
+						if not nilSeen[value] then
+							local okDesc, desc = pcall(function() return value:IsDescendantOf(game) end)
+							if okDesc and not desc and gcInstanceAllowed(value) then
+								local fixed = fixNilInstance(value)
+								if fixed then
+									extraNil[#extraNil + 1] = fixed
+								end
+							end
+						end
+					end)
+				end
+			end
+			for _, inst in extraNil do
+				instances[#instances + 1] = inst
 			end
 			if #instances > 0 then
 				Stats.gcInstances = #instances
@@ -7025,11 +7093,11 @@ local function synsaveinstance(...)
 			return chunks, ctx
 		end
 
-		local externalPassDone = false
+		local externalPassCount = 0
 		local function buildWithExternals()
 			local chunks, ctx = buildOutput()
-			if OPTIONS.ExternalContentPass and OPTIONS.Binary and not externalPassDone and next(ExternalContentPending) then
-				externalPassDone = true
+			while OPTIONS.ExternalContentPass and OPTIONS.Binary and externalPassCount < 3 and next(ExternalContentPending) do
+				externalPassCount += 1
 				local list = {}
 				for object in ExternalContentPending do
 					if typeof(object) == "Instance" then
@@ -7037,12 +7105,13 @@ local function synsaveinstance(...)
 					end
 				end
 				table.clear(ExternalContentPending)
-				if #list > 0 then
-					register_extra("External Content", list)
-					local rebuilt, rebuiltCtx = buildOutput()
-					Stats.externalContent = #list
-					return rebuilt, rebuiltCtx
+				if #list == 0 then
+					break
 				end
+				register_extra("External Content " .. externalPassCount, list)
+				chunks, ctx = buildOutput()
+				Stats.externalContent += #list
+				Stats.contentPasses = externalPassCount
 			end
 			return chunks, ctx
 		end
@@ -7251,6 +7320,20 @@ local function synsaveinstance(...)
 		table.clear(defaultObjects)
 		table.clear(Accum.gone)
 		table.clear(Accum.order)
+		if writefile and next(RemoteLogData) then
+			pcall(function()
+				writefile(REMOTE_LOG_FILE, service.HttpService:JSONEncode(RemoteLogData))
+			end)
+		end
+		if writefile and RecoveredScripts and #RecoveredScripts > 0 then
+			pcall(function()
+				writefile(RECOVERED_SCRIPTS_FILE, service.HttpService:JSONEncode({
+					placeId = game.PlaceId,
+					time = os.time(),
+					scripts = RecoveredScripts,
+				}))
+			end)
+		end
 		stopWatermark()
 		GLOBAL_ENV[guardKey] = nil
 	end
@@ -7374,21 +7457,37 @@ local function synsaveinstance(...)
 			return oldNamecall(self, ...)
 		end))
 		local function listen(remote)
-			Connect(remote.OnClientEvent, function(...)
-				if remoteLogActive then
-					recordRemote(remote, "in", "OnClientEvent", ...)
-				end
-			end)
+			if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
+				Connect(remote.OnClientEvent, function(...)
+					if remoteLogActive then
+						recordRemote(remote, "in", "OnClientEvent", ...)
+					end
+				end)
+			elseif remote:IsA("BindableEvent") then
+				Connect(remote.Event, function(...)
+					if remoteLogActive then
+						recordRemote(remote, "in", "Bindable.Fire", ...)
+					end
+				end)
+			elseif remote:IsA("RemoteFunction") then
+				pcall(recordRemote, remote, "meta", "RemoteFunction", nil)
+			end
+		end
+		local function isLoggable(descendant)
+			return descendant:IsA("RemoteEvent")
+				or descendant:IsA("UnreliableRemoteEvent")
+				or descendant:IsA("BindableEvent")
+				or descendant:IsA("RemoteFunction")
 		end
 		for _, root in ToSaveList do
 			if typeof(root) == "Instance" and root ~= game then
 				for _, descendant in root:GetDescendants() do
-					if descendant:IsA("RemoteEvent") then
+					if isLoggable(descendant) then
 						listen(descendant)
 					end
 				end
 				Connect(root.DescendantAdded, function(descendant)
-					if descendant:IsA("RemoteEvent") then
+					if isLoggable(descendant) then
 						listen(descendant)
 					end
 				end)
@@ -8052,6 +8151,47 @@ local function synsaveinstance(...)
 
 	flushDiskCache()
 	saveGHPState()
+
+	if ok and writefile then
+		pcall(function()
+			local history = {}
+			if isfile and readfile and isfile(STATS_HISTORY_FILE) then
+				local okH, dataH = pcall(function()
+					return service.HttpService:JSONDecode(readfile(STATS_HISTORY_FILE))
+				end)
+				if okH and type(dataH) == "table" then
+					history = dataH
+				end
+			end
+			local entry = {
+				time = os.time(),
+				placeId = game.PlaceId,
+				file = placename,
+				instances = Stats.instances,
+				scripts = Stats.scripts,
+				scriptsOk = Stats.scriptsOk,
+				scriptsFailed = Stats.scriptsFailed,
+				terrain = Stats.terrain,
+				sweepPoints = Stats.sweepPoints,
+				accumulated = Stats.accumulated,
+				gcInstances = Stats.gcInstances,
+				gcTables = Stats.gcTables,
+				remotes = Stats.remotes,
+				externalContent = Stats.externalContent,
+				contentPasses = Stats.contentPasses,
+				remoteLogLoaded = Stats.remoteLogLoaded,
+				assetsDownloaded = Stats.assetsDownloaded,
+				assetsFailed = Stats.assetsFailed,
+				elapsed = elapse_t,
+				size = totalsize,
+			}
+			history[#history + 1] = entry
+			while #history > 20 do
+				table.remove(history, 1)
+			end
+			writefile(STATS_HISTORY_FILE, service.HttpService:JSONEncode(history))
+		end)
+	end
 
 	if ok and OPTIONS.CompletenessReport then
 		warn(table.concat(completenessLines(), "\n"))
