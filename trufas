@@ -404,6 +404,9 @@ local __BREAK = "__BREAK" .. service.HttpService:GenerateGUID(false)
 local USSI_FOLDER = "ussi_cache/"
 local ASSET_FOLDER = "ussi_assets/"
 local CHECKPOINT_FILE = USSI_FOLDER .. "checkpoint.json"
+local REMOTE_LOG_FILE = USSI_FOLDER .. "remote_log.json"
+local RECOVERED_SCRIPTS_FILE = USSI_FOLDER .. "recovered_scripts.json"
+local STATS_HISTORY_FILE = USSI_FOLDER .. "stats_history.json"
 
 pcall(function()
 	makefolder(USSI_FOLDER)
